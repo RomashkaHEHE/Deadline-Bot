@@ -3,3 +3,4 @@ __pycache__
 deadline-bot-release.tar.gz
 gha-logs.zip
 gha-logs/
+deadlines.json
