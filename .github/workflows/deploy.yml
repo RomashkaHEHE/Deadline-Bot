@@ -35,15 +35,22 @@ jobs:
 
       - name: Build release archive
         run: |
-          tar \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.env' \
-            --exclude='.venv' \
-            --exclude='__pycache__' \
-            --exclude='deadlines.json' \
-            --exclude='deadline-bot-release.tar.gz' \
-            -czf deadline-bot-release.tar.gz .
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+
+          root = Path.cwd()
+          archive_path = root / "deadline-bot-release.tar.gz"
+          excludes = {".git", ".github", ".env", ".venv", "__pycache__", "deadlines.json", archive_path.name}
+
+          with tarfile.open(archive_path, "w:gz") as tar:
+              for path in root.rglob("*"):
+                  rel = path.relative_to(root)
+                  if any(part in excludes for part in rel.parts):
+                      continue
+                  if path.is_file():
+                      tar.add(path, arcname=rel.as_posix())
+          PY
 
       - name: Configure SSH
         if: ${{ env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' }}
