@@ -14,6 +14,7 @@ jobs:
       DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_SSH_KEY_B64: ${{ secrets.DEPLOY_SSH_KEY_B64 }}
       DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
 
     steps:
@@ -53,11 +54,15 @@ jobs:
           PY
 
       - name: Configure SSH
-        if: ${{ env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' }}
+        if: ${{ env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && (env.DEPLOY_SSH_KEY != '' || env.DEPLOY_SSH_KEY_B64 != '') }}
         run: |
           install -m 700 -d ~/.ssh
-          printf '%s' "$DEPLOY_SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
-          printf '\n' >> ~/.ssh/id_ed25519
+          if [[ -n "${DEPLOY_SSH_KEY_B64}" ]]; then
+            printf '%s' "$DEPLOY_SSH_KEY_B64" | tr -d '\r\n ' | base64 -d > ~/.ssh/id_ed25519
+          else
+            printf '%s' "$DEPLOY_SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
+            printf '\n' >> ~/.ssh/id_ed25519
+          fi
           chmod 600 ~/.ssh/id_ed25519
           ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null
           if [[ -n "${DEPLOY_KNOWN_HOSTS}" ]]; then
@@ -68,18 +73,18 @@ jobs:
           fi
 
       - name: Upload release archive
-        if: ${{ env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' }}
+        if: ${{ env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && (env.DEPLOY_SSH_KEY != '' || env.DEPLOY_SSH_KEY_B64 != '') }}
         run: |
           scp -i ~/.ssh/id_ed25519 -P "${DEPLOY_PORT:-22}" deadline-bot-release.tar.gz "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/deadline-bot-release.tar.gz"
 
       - name: Secrets missing notice
-        if: ${{ env.DEPLOY_HOST == '' || env.DEPLOY_USER == '' || env.DEPLOY_SSH_KEY == '' }}
+        if: ${{ env.DEPLOY_HOST == '' || env.DEPLOY_USER == '' || (env.DEPLOY_SSH_KEY == '' && env.DEPLOY_SSH_KEY_B64 == '') }}
         run: |
           echo "GitHub Actions secrets for deployment are not configured yet."
-          echo "Add DEPLOY_HOST, DEPLOY_USER and DEPLOY_SSH_KEY, then rerun this workflow."
+          echo "Add DEPLOY_HOST, DEPLOY_USER and either DEPLOY_SSH_KEY or DEPLOY_SSH_KEY_B64, then rerun this workflow."
 
       - name: Run remote deploy
-        if: ${{ env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && env.DEPLOY_SSH_KEY != '' }}
+        if: ${{ env.DEPLOY_HOST != '' && env.DEPLOY_USER != '' && (env.DEPLOY_SSH_KEY != '' || env.DEPLOY_SSH_KEY_B64 != '') }}
         env:
           APP_DIR: /opt/deadline-bot/app
           VENV_DIR: /opt/deadline-bot/.venv
