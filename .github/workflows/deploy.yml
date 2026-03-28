@@ -42,6 +42,7 @@ jobs:
             --exclude='.venv' \
             --exclude='__pycache__' \
             --exclude='deadlines.json' \
+            --exclude='deadline-bot-release.tar.gz' \
             -czf deadline-bot-release.tar.gz .
 
       - name: Configure SSH
