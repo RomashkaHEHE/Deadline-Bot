@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class MessageTemplate:
+    # Each template returns the exact payload that will be sent to Telegram.
+    # Keep channel-only footer text and HTML decisions here, not in app.py.
     text: str
     parse_mode: str | None = "HTML"
 
@@ -19,6 +21,7 @@ BUTTON_SKIP = "Пропустить"
 BUTTON_ABORT = "Отмена"
 
 EMOJIS = {
+    # Central registry for reusable Telegram custom emoji snippets.
     "soon": '<tg-emoji emoji-id="5440621591387980068">🔜</tg-emoji>',
 }
 

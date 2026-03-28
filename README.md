@@ -2,6 +2,15 @@
 
 Бот для напоминания о дедлайнах
 
+## Для входа в проект
+
+Если нужно быстро понять текущую структуру проекта, начните с этих файлов:
+
+- [docs/ARCHITECTURE.md](C:/Users/Roma/Desktop/projects/deadline%20bot/docs/ARCHITECTURE.md) — архитектура, жизненный цикл дедлайна, хранение данных, роли файлов
+- [docs/DEVELOPMENT_GUIDE.md](C:/Users/Roma/Desktop/projects/deadline%20bot/docs/DEVELOPMENT_GUIDE.md) — где что менять, как безопасно править логику и шаблоны
+- [bot_messages.py](C:/Users/Roma/Desktop/projects/deadline%20bot/bot_messages.py) — все тексты, HTML и кастомные emoji
+- [app.py](C:/Users/Roma/Desktop/projects/deadline%20bot/app.py) — основная логика бота
+
 ## Формат дедлайнов
 
 ```text

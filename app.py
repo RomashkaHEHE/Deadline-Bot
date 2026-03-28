@@ -72,6 +72,8 @@ class ChannelMessageRecord:
 
 @dataclass
 class Deadline:
+    # We keep both plain text and Telegram-renderable HTML so that the bot can
+    # preserve formatting from the original user message in channel posts.
     id: int
     description: str
     description_html: str
@@ -102,6 +104,9 @@ class Deadline:
 
 
 class DeadlineStore:
+    # JSON file storage is the only persistence layer in this project.
+    # Schema changes should stay explicit and usually come with a one-time
+    # migration of the existing JSON file rather than permanent fallback code.
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = asyncio.Lock()
@@ -256,6 +261,8 @@ def format_deadline(deadline: Deadline) -> str:
 
 
 def deadline_context(deadline: Deadline) -> dict:
+    # Templates in bot_messages.py work with a precomputed render context so the
+    # message file stays declarative and does not need to know model internals.
     line = format_deadline_line(deadline.deadline_datetime, deadline.time_was_provided)
     status_map = {
         STATUS_ACTIVE: "активный",
@@ -353,6 +360,8 @@ async def post_channel_template(
     *,
     kind: str,
 ) -> Message:
+    # Every deadline-related channel post must go through this helper so we can
+    # later edit or delete the full message history for that deadline.
     sent = await context.bot.send_message(
         chat_id=CHANNEL_ID,
         text=template.text,
@@ -386,6 +395,8 @@ async def mark_deadline_completed(context: ContextTypes.DEFAULT_TYPE, deadline: 
         return
 
     if deadline.channel_messages:
+        # Product choice: completion does not create a new post. Instead we edit
+        # the latest deadline-related channel message and schedule cleanup.
         last_record = deadline.channel_messages[-1]
         template = msg.deadline_completed_post(deadline_context(deadline))
         try:
@@ -582,6 +593,8 @@ async def cancel_deadline_finish(update: Update, context: ContextTypes.DEFAULT_T
         return CANCEL_SELECT
 
     deadline.status = STATUS_CANCELLED
+    # Cancelled deadlines stay in archive history, but their channel posts are
+    # removed only after the 3-day cleanup window.
     deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
     await STORE.update(deadline)
     await post_channel_template(context, deadline, msg.deadline_cancelled_post(deadline_context(deadline)), kind="cancelled")
@@ -616,6 +629,8 @@ async def delete_deadline_finish(update: Update, context: ContextTypes.DEFAULT_T
         await reply(update.message, msg.deadline_not_found_by_id(), reply_markup=input_keyboard())
         return DELETE_SELECT
 
+    # Manual delete is stronger than cancel: remove all channel traces now and
+    # move the deadline directly into archive state.
     await delete_all_deadline_messages(context, deadline)
     deadline.status = STATUS_ARCHIVED
     deadline.archived_at = bot_now().isoformat()
@@ -807,6 +822,9 @@ async def abort_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 async def reminder_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # One repeating loop handles both reminder delivery and delayed cleanup.
+    # This keeps scheduling logic in a single place and makes restart behavior
+    # deterministic: after restart, the loop simply reconciles current state.
     for deadline in STORE.list_all():
         if deadline.status == STATUS_ACTIVE:
             remaining = now_until(deadline.deadline_datetime)

@@ -79,6 +79,8 @@ def payload_from_update(update: Update) -> dict:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # tools.py is intentionally isolated from app.py logic. It is a separate
+    # one-off utility bot that reuses the same token for inspection tasks.
     await update.message.reply_text(
         "Tools mode.\nНажмите кнопку ниже.",
         reply_markup=main_keyboard(),
