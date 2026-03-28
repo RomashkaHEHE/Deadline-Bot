@@ -27,11 +27,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOGGER = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-STORAGE_PATH = BASE_DIR / "deadlines.json"
+STORAGE_PATH = Path(os.getenv("DEADLINES_STORAGE_PATH", BASE_DIR / "deadlines.json")).expanduser()
 
 CREATE_DESCRIPTION, CREATE_DATETIME, CREATE_CONFIRM = range(3)
 CANCEL_SELECT = 10
@@ -105,6 +107,7 @@ class DeadlineStore:
         self._lock = asyncio.Lock()
         self._deadlines: list[Deadline] = []
         self._next_id = 1
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._load()
 
     def _load(self) -> None:

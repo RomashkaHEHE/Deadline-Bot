@@ -1,0 +1,19 @@
+[Unit]
+Description=Deadline Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deadlinebot
+Group=deadlinebot
+WorkingDirectory=/opt/deadline-bot/app
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/deadline-bot/deadline-bot.env
+ExecStart=/opt/deadline-bot/.venv/bin/python /opt/deadline-bot/app/app.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

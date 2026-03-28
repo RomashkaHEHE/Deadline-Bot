@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -15,6 +16,12 @@ from telegram.ext import (
 
 
 load_dotenv()
+logging.basicConfig(
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 DEBUG_INPUT = 1
