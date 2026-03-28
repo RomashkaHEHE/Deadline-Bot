@@ -232,7 +232,7 @@ def edit_saved_with_change_no_publish() -> MessageTemplate:
 
 
 def edit_saved_no_publish() -> MessageTemplate:
-    return MessageTemplate("Обновленный дедлайн сохранен без немедленной публикации.")
+    return MessageTemplate("Обновленный дедлайн сохранен без немедленной публикации")
 
 
 def cancelled() -> MessageTemplate:

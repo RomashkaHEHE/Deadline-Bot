@@ -1,2 +1,5 @@
 .env
 __pycache__
+deadline-bot-release.tar.gz
+gha-logs.zip
+gha-logs/
