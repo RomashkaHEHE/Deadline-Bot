@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -317,16 +318,45 @@ def build_changes(old_deadline: Deadline, new_deadline: Deadline) -> list[dict]:
     return changes
 
 
+async def maybe_handle_menu_navigation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[bool, int | None]:
+    message = update.effective_message
+    if message is None or not message.text:
+        return False, None
+
+    text = message.text.strip()
+    if text == BUTTON_ABORT:
+        return True, await abort_conversation(update, context)
+    if text == BUTTON_NEW:
+        return True, await create_start(update, context)
+    if text == BUTTON_LIST:
+        await list_deadlines(update, context)
+        return True, ConversationHandler.END
+    if text == BUTTON_ARCHIVE:
+        await list_archive(update, context)
+        return True, ConversationHandler.END
+    if text == BUTTON_EDIT:
+        return True, await edit_start(update, context)
+    if text == BUTTON_CANCEL_DEADLINE:
+        return True, await cancel_deadline_start(update, context)
+    if text == BUTTON_DELETE_DEADLINE:
+        return True, await delete_deadline_start(update, context)
+    return False, None
+
+
 def parse_deadline_input(raw_text: str) -> tuple[datetime, bool, bool]:
     parts = raw_text.split()
     if len(parts) not in (1, 2):
         raise ValueError(msg.invalid_datetime_format().text)
 
     now = bot_now()
+    if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", parts[0]):
+        raise ValueError(msg.invalid_date_format().text)
     try:
         date_value = datetime.strptime(parts[0], "%d.%m.%Y")
     except ValueError as exc:
-        raise ValueError(msg.invalid_date_format().text) from exc
+        raise ValueError(msg.invalid_date_value().text) from exc
 
     deadline_date = date_value.replace(tzinfo=BOT_TIMEZONE)
 
@@ -334,10 +364,12 @@ def parse_deadline_input(raw_text: str) -> tuple[datetime, bool, bool]:
     time_was_explicit_midnight = False
 
     if time_was_provided:
+        if not re.fullmatch(r"\d{2}:\d{2}", parts[1]):
+            raise ValueError(msg.invalid_time_format().text)
         try:
             time_value = datetime.strptime(parts[1], "%H:%M")
         except ValueError as exc:
-            raise ValueError(msg.invalid_time_format().text) from exc
+            raise ValueError(msg.invalid_time_value().text) from exc
         deadline_date = deadline_date.replace(hour=time_value.hour, minute=time_value.minute)
         time_was_explicit_midnight = parts[1] == "00:00"
     else:
@@ -443,10 +475,11 @@ async def align_reminder_flags(deadline: Deadline) -> None:
     await STORE.update(deadline)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_whitelist(update):
-        return
+        return ConversationHandler.END
     await reply(update.message, msg.start_message(), reply_markup=main_keyboard())
+    return ConversationHandler.END
 
 
 async def show_current_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -495,6 +528,10 @@ async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def create_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
     context.user_data["new_description"] = update.message.text.strip()
     context.user_data["new_description_html"] = update.message.text_html or escape(update.message.text.strip())
     await reply(
@@ -506,6 +543,10 @@ async def create_description(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def create_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
     try:
         deadline_at, time_was_provided, time_was_explicit_midnight = parse_deadline_input(update.message.text.strip())
     except ValueError as exc:
@@ -581,6 +622,10 @@ async def cancel_deadline_start(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def cancel_deadline_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
     try:
         deadline_id = int(update.message.text.strip())
     except ValueError:
@@ -618,6 +663,10 @@ async def delete_deadline_start(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def delete_deadline_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
     try:
         deadline_id = int(update.message.text.strip())
     except ValueError:
@@ -655,6 +704,10 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
     try:
         deadline_id = int(update.message.text.strip())
     except ValueError:
@@ -681,6 +734,10 @@ async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def edit_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
     raw_text = update.message.text.strip()
     if raw_text == BUTTON_SKIP:
         context.user_data["edit_description"] = context.user_data["edit_original_description"]
@@ -697,6 +754,10 @@ async def edit_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def edit_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
     deadline = STORE.get(context.user_data["edit_deadline_id"])
     if deadline is None or deadline.status != STATUS_ACTIVE:
         await reply(update.message, msg.deadline_missing(), reply_markup=main_keyboard())
@@ -880,6 +941,7 @@ def build_application() -> Application:
             CREATE_CONFIRM: [CallbackQueryHandler(create_confirm, pattern=f"^{IMMEDIATE_CALLBACK}:")],
         },
         fallbacks=[
+            CommandHandler("start", start),
             CommandHandler("cancel", abort_conversation),
             MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
         ],
@@ -892,6 +954,7 @@ def build_application() -> Application:
         ],
         states={CANCEL_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cancel_deadline_finish)]},
         fallbacks=[
+            CommandHandler("start", start),
             CommandHandler("cancel", abort_conversation),
             MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
         ],
@@ -904,6 +967,7 @@ def build_application() -> Application:
         ],
         states={DELETE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_deadline_finish)]},
         fallbacks=[
+            CommandHandler("start", start),
             CommandHandler("cancel", abort_conversation),
             MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
         ],
@@ -921,6 +985,7 @@ def build_application() -> Application:
             EDIT_CONFIRM: [CallbackQueryHandler(edit_confirm, pattern=f"^{EDIT_IMMEDIATE_CALLBACK}:")],
         },
         fallbacks=[
+            CommandHandler("start", start),
             CommandHandler("cancel", abort_conversation),
             MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
         ],

@@ -34,9 +34,9 @@
       "initial_published": true,
       "reminded_7d": true,
       "reminded_24h": true,
-      "status": "completed",
-      "cleanup_after": "2026-03-25T14:09:04.616994+05:00",
-      "archived_at": null,
+      "status": "archived",
+      "cleanup_after": null,
+      "archived_at": "2026-03-29T03:15:04.451661+05:00",
       "channel_messages": []
     },
     {
@@ -53,9 +53,9 @@
       "initial_published": true,
       "reminded_7d": true,
       "reminded_24h": true,
-      "status": "completed",
-      "cleanup_after": "2026-03-25T14:09:04.618115+05:00",
-      "archived_at": null,
+      "status": "archived",
+      "cleanup_after": null,
+      "archived_at": "2026-03-29T03:15:04.453183+05:00",
       "channel_messages": []
     },
     {
@@ -72,9 +72,9 @@
       "initial_published": true,
       "reminded_7d": true,
       "reminded_24h": true,
-      "status": "completed",
-      "cleanup_after": "2026-03-25T14:09:04.618751+05:00",
-      "archived_at": null,
+      "status": "archived",
+      "cleanup_after": null,
+      "archived_at": "2026-03-29T03:15:04.454573+05:00",
       "channel_messages": []
     },
     {
@@ -91,9 +91,9 @@
       "initial_published": true,
       "reminded_7d": true,
       "reminded_24h": true,
-      "status": "completed",
-      "cleanup_after": "2026-03-25T14:09:04.619349+05:00",
-      "archived_at": null,
+      "status": "archived",
+      "cleanup_after": null,
+      "archived_at": "2026-03-29T03:15:04.455907+05:00",
       "channel_messages": []
     },
     {
@@ -129,18 +129,10 @@
       "initial_published": true,
       "reminded_7d": true,
       "reminded_24h": true,
-      "status": "completed",
-      "cleanup_after": "2026-03-25T14:31:04.113722+05:00",
-      "archived_at": null,
-      "channel_messages": [
-        {
-          "message_id": 29,
-          "text": "проверка выключения бота при активном дедлайне.\nкстати, форматирование\nдобавляю дедлайн, выключаю бота, жду завершения дедлайна, включая бота, смотрю результат\n22.03 14:29\n<b>дедлайн завершён</b>",
-          "parse_mode": "HTML",
-          "kind": "completed",
-          "created_at": "2026-03-22T14:27:19.128434+05:00"
-        }
-      ]
+      "status": "archived",
+      "cleanup_after": null,
+      "archived_at": "2026-03-29T03:15:04.780155+05:00",
+      "channel_messages": []
     },
     {
       "id": 8,
@@ -156,8 +148,8 @@
       "initial_published": true,
       "reminded_7d": true,
       "reminded_24h": true,
-      "status": "active",
-      "cleanup_after": null,
+      "status": "completed",
+      "cleanup_after": "2026-04-01T03:15:04.884930+05:00",
       "archived_at": null,
       "channel_messages": [
         {

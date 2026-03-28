@@ -69,8 +69,16 @@ def invalid_date_format() -> MessageTemplate:
     return MessageTemplate("Дата должна быть в формате <code>DD.MM.YYYY</code>.")
 
 
+def invalid_date_value() -> MessageTemplate:
+    return MessageTemplate("Такой даты не существует.")
+
+
 def invalid_time_format() -> MessageTemplate:
     return MessageTemplate("Время должно быть в формате <code>HH:MM</code>.")
+
+
+def invalid_time_value() -> MessageTemplate:
+    return MessageTemplate("Такого времени не существует.")
 
 
 def deadline_must_be_future() -> MessageTemplate:
