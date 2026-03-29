@@ -25,6 +25,7 @@ The main bot runtime. It is responsible for:
 - parsing user input
 - posting messages into the channel
 - tracking posted channel messages
+- replacing older active-deadline posts with one fresh reminder post
 - editing the latest channel message when a deadline completes
 - deleting all deadline-related channel messages after the cleanup window
 - serving archive and active lists
@@ -86,6 +87,7 @@ Each channel message record stores:
 - `parse_mode`
 - semantic kind, for example `initial`, `reminder_7d`, `changed`
 - creation time
+- `template_data` with the structured payload needed to rebuild that post later
 
 ## Deadline Lifecycle
 
@@ -104,7 +106,9 @@ An active deadline:
 - can be edited
 - can be cancelled
 - can be manually deleted into archive
+- can be manually reminded
 - participates in reminder scheduling
+- keeps at most one current "live" post in the channel; each reminder replaces older active posts
 
 ### Cancelled
 
@@ -149,6 +153,7 @@ That is not optional metadata. It is required because:
 Because of that, any new channel post must be sent through `post_channel_template(...)` in `app.py`.
 
 If a new code path sends directly via `context.bot.send_message(...)`, cleanup will become incomplete.
+It will also break retroactive template refresh, because the bot will not have the structured data required to rebuild the post.
 
 ## Formatting Rules
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -39,6 +40,7 @@ STORAGE_PATH = Path(os.getenv("DEADLINES_STORAGE_PATH", BASE_DIR / "deadlines.js
 CREATE_DESCRIPTION, CREATE_DATETIME, CREATE_CONFIRM = range(3)
 CANCEL_SELECT = 10
 DELETE_SELECT = 11
+REMIND_SELECT = 12
 EDIT_SELECT, EDIT_DESCRIPTION, EDIT_DATETIME, EDIT_CONFIRM = range(20, 24)
 
 IMMEDIATE_CALLBACK = "immediate_publish"
@@ -50,6 +52,8 @@ BUTTON_ARCHIVE = msg.BUTTON_ARCHIVE
 BUTTON_EDIT = msg.BUTTON_EDIT
 BUTTON_CANCEL_DEADLINE = msg.BUTTON_CANCEL_DEADLINE
 BUTTON_DELETE_DEADLINE = msg.BUTTON_DELETE_DEADLINE
+BUTTON_REMIND = msg.BUTTON_REMIND
+BUTTON_REFRESH_POSTS = msg.BUTTON_REFRESH_POSTS
 BUTTON_SKIP = msg.BUTTON_SKIP
 BUTTON_ABORT = msg.BUTTON_ABORT
 
@@ -69,6 +73,9 @@ class ChannelMessageRecord:
     parse_mode: str | None
     kind: str
     created_at: str
+    # Structured data needed to rebuild this message with a newer template.
+    # Legacy records may have it empty; such posts are skipped during refresh.
+    template_data: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -194,8 +201,16 @@ def get_required_env(name: str) -> str:
     return value.strip()
 
 
+def get_optional_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if not value:
+        return None
+    return int(value.strip())
+
+
 BOT_TOKEN = get_required_env("TOKEN")
 CHANNEL_ID = get_required_env("CHANNEL_ID")
+CHANNEL_THREAD_ID = get_optional_int_env("CHANNEL_THREAD_ID")
 WHITELIST_USER_IDS = {
     int(item.strip())
     for item in os.getenv("WHITELIST_USER_IDS", "").split(",")
@@ -214,6 +229,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [BUTTON_NEW, BUTTON_EDIT],
             [BUTTON_LIST, BUTTON_ARCHIVE],
             [BUTTON_CANCEL_DEADLINE, BUTTON_DELETE_DEADLINE],
+            [BUTTON_REMIND, BUTTON_REFRESH_POSTS],
         ],
         resize_keyboard=True,
     )
@@ -290,6 +306,40 @@ def deadline_context(deadline: Deadline) -> dict:
     }
 
 
+def remaining_message_context(deadline_at: datetime) -> dict:
+    remaining = max(now_until(deadline_at), timedelta())
+    total_seconds = int(remaining.total_seconds())
+
+    if remaining > timedelta(days=1):
+        value = max(1, total_seconds // 86400)
+        label = "Осталось дней"
+    elif remaining >= timedelta(hours=2):
+        value = max(1, total_seconds // 3600)
+        label = "Осталось часов"
+    else:
+        value = max(1, total_seconds // 60)
+        label = "Осталось минут"
+
+    return {
+        "remaining_value": value,
+        "remaining_label": label,
+        "remaining_label_html": escape(label),
+    }
+
+
+def live_deadline_context(deadline: Deadline) -> dict:
+    context = deadline_context(deadline)
+    context.update(remaining_message_context(deadline.deadline_datetime))
+    return context
+
+
+def live_deadline_context_from_payload(payload: dict) -> dict:
+    context = dict(payload)
+    deadline_at = ensure_bot_timezone(datetime.fromisoformat(payload["deadline_iso"]))
+    context.update(remaining_message_context(deadline_at))
+    return context
+
+
 def build_changes(old_deadline: Deadline, new_deadline: Deadline) -> list[dict]:
     changes: list[dict] = []
     if old_deadline.description != new_deadline.description:
@@ -342,6 +392,11 @@ async def maybe_handle_menu_navigation(
         return True, await cancel_deadline_start(update, context)
     if text == BUTTON_DELETE_DEADLINE:
         return True, await delete_deadline_start(update, context)
+    if text == BUTTON_REMIND:
+        return True, await remind_deadline_start(update, context)
+    if text == BUTTON_REFRESH_POSTS:
+        await refresh_channel_posts(update, context)
+        return True, ConversationHandler.END
     return False, None
 
 
@@ -385,19 +440,58 @@ def now_until(deadline_at: datetime) -> timedelta:
     return ensure_bot_timezone(deadline_at) - bot_now()
 
 
+def deadline_template_data(deadline: Deadline) -> dict:
+    return {"deadline": deadline_context(deadline)}
+
+
+def live_deadline_template_data(deadline: Deadline) -> dict:
+    return {"deadline": live_deadline_context(deadline)}
+
+
+def changed_template_data(changes: list[dict], old_deadline: dict, new_deadline: dict) -> dict:
+    return {
+        "changes": changes,
+        "old_deadline": old_deadline,
+        "new_deadline": new_deadline,
+    }
+
+
+def render_channel_template(record: ChannelMessageRecord) -> msg.MessageTemplate:
+    # Refreshing channel posts must use the same structured payload that was
+    # stored when the post was first created, otherwise old reminders/changes
+    # could silently turn into messages about the current state instead.
+    data = record.template_data
+    if not data:
+        raise ValueError("legacy channel message without template data")
+
+    if record.kind in {"initial", "reminder_7d", "reminder_24h", "reminder_manual"}:
+        return msg.active_deadline_post(live_deadline_context_from_payload(data["deadline"]))
+    if record.kind == "cancelled":
+        return msg.deadline_cancelled_post(data["deadline"])
+    if record.kind == "completed":
+        return msg.deadline_completed_post(data["deadline"])
+    if record.kind == "changed":
+        return msg.deadline_changed_post(data["changes"], data["old_deadline"], data["new_deadline"])
+    raise ValueError(f"unknown channel message kind: {record.kind}")
+
+
 async def post_channel_template(
     context: ContextTypes.DEFAULT_TYPE,
     deadline: Deadline,
     template: msg.MessageTemplate,
     *,
     kind: str,
+    template_data: dict,
 ) -> Message:
     # Every deadline-related channel post must go through this helper so we can
     # later edit or delete the full message history for that deadline.
+    # We also persist template_data here, because retroactive refresh must
+    # rebuild old posts from structured data rather than by mutating raw text.
     sent = await context.bot.send_message(
         chat_id=CHANNEL_ID,
         text=template.text,
         parse_mode=template.parse_mode,
+        message_thread_id=CHANNEL_THREAD_ID,
     )
     deadline.channel_messages.append(
         ChannelMessageRecord(
@@ -406,10 +500,36 @@ async def post_channel_template(
             parse_mode=template.parse_mode,
             kind=kind,
             created_at=bot_now().isoformat(),
+            template_data=template_data,
         )
     )
     await STORE.update(deadline)
     return sent
+
+
+async def publish_live_deadline_post(
+    context: ContextTypes.DEFAULT_TYPE,
+    deadline: Deadline,
+    *,
+    kind: str,
+    replace_existing: bool,
+) -> None:
+    # The channel should keep only one "current state" post for an active
+    # deadline. Auto reminders and manual reminders therefore replace older
+    # posts instead of appending another copy of the same deadline.
+    if replace_existing:
+        await delete_all_deadline_messages(context, deadline)
+
+    template_data = live_deadline_template_data(deadline)
+    await post_channel_template(
+        context,
+        deadline,
+        msg.active_deadline_post(template_data["deadline"]),
+        kind=kind,
+        template_data=template_data,
+    )
+    deadline.initial_published = True
+    await STORE.update(deadline)
 
 
 async def delete_all_deadline_messages(context: ContextTypes.DEFAULT_TYPE, deadline: Deadline) -> None:
@@ -426,11 +546,15 @@ async def mark_deadline_completed(context: ContextTypes.DEFAULT_TYPE, deadline: 
     if deadline.status != STATUS_ACTIVE:
         return
 
+    deadline.status = STATUS_COMPLETED
+    deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
+    completed_template_data = deadline_template_data(deadline)
+
     if deadline.channel_messages:
         # Product choice: completion does not create a new post. Instead we edit
         # the latest deadline-related channel message and schedule cleanup.
         last_record = deadline.channel_messages[-1]
-        template = msg.deadline_completed_post(deadline_context(deadline))
+        template = msg.deadline_completed_post(completed_template_data["deadline"])
         try:
             await context.bot.edit_message_text(
                 chat_id=CHANNEL_ID,
@@ -441,11 +565,10 @@ async def mark_deadline_completed(context: ContextTypes.DEFAULT_TYPE, deadline: 
             last_record.text = template.text
             last_record.parse_mode = template.parse_mode
             last_record.kind = "completed"
+            last_record.template_data = completed_template_data
         except Exception as exc:
             LOGGER.warning("Failed to edit completion message for deadline %s: %s", deadline.id, exc)
 
-    deadline.status = STATUS_COMPLETED
-    deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
     await STORE.update(deadline)
 
 
@@ -456,14 +579,7 @@ async def maybe_send_initial_publication(
     force: bool,
 ) -> None:
     if now_until(deadline.deadline_datetime) <= timedelta(days=7) or force:
-        await post_channel_template(
-            context,
-            deadline,
-            msg.new_deadline_post(deadline_context(deadline)),
-            kind="initial",
-        )
-        deadline.initial_published = True
-        await STORE.update(deadline)
+        await publish_live_deadline_post(context, deadline, kind="initial", replace_existing=False)
 
 
 async def align_reminder_flags(deadline: Deadline) -> None:
@@ -519,6 +635,126 @@ async def list_archive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         msg.archive_deadlines_message([deadline_context(item) for item in deadlines]),
         reply_markup=main_keyboard(),
     )
+
+
+async def refresh_channel_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_whitelist(update):
+        return
+
+    all_deadlines = STORE.list_all()
+    total_messages = sum(len(deadline.channel_messages) for deadline in all_deadlines)
+    if total_messages == 0:
+        await reply(update.message, msg.no_channel_posts_to_refresh(), reply_markup=main_keyboard())
+        return
+
+    updated = 0
+    unchanged = 0
+    skipped = 0
+    failed = 0
+
+    for deadline in all_deadlines:
+        dirty = False
+        for record in deadline.channel_messages:
+            try:
+                template = render_channel_template(record)
+            except Exception as exc:
+                skipped += 1
+                LOGGER.warning(
+                    "Skipping refresh for deadline %s message %s: %s",
+                    deadline.id,
+                    record.message_id,
+                    exc,
+                )
+                continue
+
+            if template.text == record.text and template.parse_mode == record.parse_mode:
+                unchanged += 1
+                continue
+
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=CHANNEL_ID,
+                    message_id=record.message_id,
+                    text=template.text,
+                    parse_mode=template.parse_mode,
+                )
+            except BadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    unchanged += 1
+                    record.text = template.text
+                    record.parse_mode = template.parse_mode
+                    dirty = True
+                    continue
+
+                failed += 1
+                LOGGER.warning(
+                    "Failed to refresh deadline %s message %s: %s",
+                    deadline.id,
+                    record.message_id,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                failed += 1
+                LOGGER.warning(
+                    "Failed to refresh deadline %s message %s: %s",
+                    deadline.id,
+                    record.message_id,
+                    exc,
+                )
+                continue
+
+            record.text = template.text
+            record.parse_mode = template.parse_mode
+            updated += 1
+            dirty = True
+
+        if dirty:
+            await STORE.update(deadline)
+
+    await reply(
+        update.message,
+        msg.refreshed_channel_posts(updated, unchanged, skipped, failed),
+        reply_markup=main_keyboard(),
+    )
+
+
+async def remind_deadline_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await require_whitelist(update):
+        return ConversationHandler.END
+    deadlines = STORE.list_active()
+    if not deadlines:
+        await reply(update.message, msg.no_active_deadlines(), reply_markup=main_keyboard())
+        return ConversationHandler.END
+    await reply(
+        update.message,
+        msg.choose_remind_id([deadline_context(item) for item in deadlines]),
+        reply_markup=input_keyboard(),
+    )
+    return REMIND_SELECT
+
+
+async def remind_deadline_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
+    try:
+        deadline_id = int(update.message.text.strip())
+    except ValueError:
+        await reply(update.message, msg.numeric_id_required(), reply_markup=input_keyboard())
+        return REMIND_SELECT
+
+    deadline = STORE.get(deadline_id)
+    if deadline is None or deadline.status != STATUS_ACTIVE:
+        await reply(update.message, msg.deadline_not_found_by_id(), reply_markup=input_keyboard())
+        return REMIND_SELECT
+
+    await publish_live_deadline_post(context, deadline, kind="reminder_manual", replace_existing=True)
+    await align_reminder_flags(deadline)
+    await reply(update.message, msg.deadline_reminded_private(), reply_markup=main_keyboard())
+    return ConversationHandler.END
+
 
 async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_whitelist(update):
@@ -642,7 +878,14 @@ async def cancel_deadline_finish(update: Update, context: ContextTypes.DEFAULT_T
     # removed only after the 3-day cleanup window.
     deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
     await STORE.update(deadline)
-    await post_channel_template(context, deadline, msg.deadline_cancelled_post(deadline_context(deadline)), kind="cancelled")
+    template_data = deadline_template_data(deadline)
+    await post_channel_template(
+        context,
+        deadline,
+        msg.deadline_cancelled_post(template_data["deadline"]),
+        kind="cancelled",
+        template_data=template_data,
+    )
     await reply(update.message, msg.deadline_cancelled_private(), reply_markup=main_keyboard())
     return ConversationHandler.END
 
@@ -813,11 +1056,13 @@ async def edit_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await STORE.update(deadline)
         await align_reminder_flags(deadline)
         if had_any_publication:
+            template_data = changed_template_data(changes, deadline_context(old_deadline), deadline_context(deadline))
             await post_channel_template(
                 context,
                 deadline,
-                msg.deadline_changed_post(changes, deadline_context(old_deadline), deadline_context(deadline)),
+                msg.deadline_changed_post(changes, template_data["old_deadline"], template_data["new_deadline"]),
                 kind="changed",
+                template_data=template_data,
             )
             await reply(update.message, msg.deadline_changed_notice(), reply_markup=main_keyboard())
         else:
@@ -865,11 +1110,13 @@ async def edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         template = msg.edit_saved_with_change_no_publish() if had_any_publication else msg.edit_saved_no_publish()
 
     if had_any_publication:
+        template_data = changed_template_data(changes, old_context, new_context)
         await post_channel_template(
             context,
             deadline,
-            msg.deadline_changed_post(changes, old_context, new_context),
+            msg.deadline_changed_post(changes, template_data["old_deadline"], template_data["new_deadline"]),
             kind="changed",
+            template_data=template_data,
         )
     await align_reminder_flags(deadline)
     await query.edit_message_text(template.text, parse_mode=template.parse_mode)
@@ -894,22 +1141,12 @@ async def reminder_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             if not deadline.reminded_7d and remaining <= timedelta(days=7):
-                await post_channel_template(
-                    context,
-                    deadline,
-                    msg.reminder_7d_post(deadline_context(deadline)),
-                    kind="reminder_7d",
-                )
+                await publish_live_deadline_post(context, deadline, kind="reminder_7d", replace_existing=True)
                 deadline.reminded_7d = True
                 await STORE.update(deadline)
 
             if not deadline.reminded_24h and remaining <= timedelta(hours=24):
-                await post_channel_template(
-                    context,
-                    deadline,
-                    msg.reminder_24h_post(deadline_context(deadline)),
-                    kind="reminder_24h",
-                )
+                await publish_live_deadline_post(context, deadline, kind="reminder_24h", replace_existing=True)
                 deadline.reminded_24h = True
                 await STORE.update(deadline)
             continue
@@ -973,6 +1210,19 @@ def build_application() -> Application:
         ],
     )
 
+    remind_deadline_conversation = ConversationHandler(
+        entry_points=[
+            CommandHandler("remind", remind_deadline_start),
+            MessageHandler(filters.Regex(f"^{BUTTON_REMIND}$"), remind_deadline_start),
+        ],
+        states={REMIND_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, remind_deadline_finish)]},
+        fallbacks=[
+            CommandHandler("start", start),
+            CommandHandler("cancel", abort_conversation),
+            MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
+        ],
+    )
+
     edit_conversation = ConversationHandler(
         entry_points=[
             CommandHandler("edit", edit_start),
@@ -995,13 +1245,16 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("now", show_current_time))
     application.add_handler(CommandHandler("list", list_deadlines))
     application.add_handler(CommandHandler("archive", list_archive))
+    application.add_handler(CommandHandler("refresh_posts", refresh_channel_posts))
     application.add_handler(CommandHandler("cancel", abort_conversation))
     application.add_handler(create_conversation)
     application.add_handler(cancel_deadline_conversation)
     application.add_handler(delete_deadline_conversation)
+    application.add_handler(remind_deadline_conversation)
     application.add_handler(edit_conversation)
     application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_LIST}$"), list_deadlines))
     application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_ARCHIVE}$"), list_archive))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_REFRESH_POSTS}$"), refresh_channel_posts))
     application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
 

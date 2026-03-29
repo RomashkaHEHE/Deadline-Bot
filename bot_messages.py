@@ -17,6 +17,8 @@ BUTTON_ARCHIVE = "Архив"
 BUTTON_EDIT = "Изменить дедлайн"
 BUTTON_CANCEL_DEADLINE = "Отменить дедлайн"
 BUTTON_DELETE_DEADLINE = "Удалить дедлайн"
+BUTTON_REMIND = "Напомнить о дедлайне"
+BUTTON_REFRESH_POSTS = "Обновить посты"
 BUTTON_SKIP = "Пропустить"
 BUTTON_ABORT = "Отмена"
 
@@ -46,6 +48,10 @@ def no_active_deadlines() -> MessageTemplate:
 
 def no_archive_deadlines() -> MessageTemplate:
     return MessageTemplate("Архив пока пуст.")
+
+
+def no_channel_posts_to_refresh() -> MessageTemplate:
+    return MessageTemplate("В канале пока нет сообщений, которые можно обновить.")
 
 
 def create_prompt_description() -> MessageTemplate:
@@ -150,6 +156,11 @@ def choose_edit_id(items: list[dict]) -> MessageTemplate:
     return MessageTemplate("Отправьте id дедлайна, который нужно изменить:\n\n" + text)
 
 
+def choose_remind_id(items: list[dict]) -> MessageTemplate:
+    text = "\n\n".join(deadline_summary(item) for item in items)
+    return MessageTemplate("Отправьте id дедлайна, о котором нужно напомнить:\n\n" + text)
+
+
 def numeric_id_required() -> MessageTemplate:
     return MessageTemplate("Нужен числовой id дедлайна.")
 
@@ -164,6 +175,24 @@ def deadline_cancelled_private() -> MessageTemplate:
 
 def deadline_deleted_private() -> MessageTemplate:
     return MessageTemplate("Дедлайн удален и отправлен в архив.")
+
+
+def deadline_reminded_private() -> MessageTemplate:
+    return MessageTemplate("Напоминание опубликовано. Старые сообщения по дедлайну удалены.")
+
+
+def refreshed_channel_posts(updated: int, unchanged: int, skipped: int, failed: int) -> MessageTemplate:
+    lines = [
+        "Обновление постов завершено.",
+        f"Обновлено: <b>{updated}</b>",
+        f"Без изменений: <b>{unchanged}</b>",
+    ]
+    if skipped:
+        lines.append(f"Пропущено: <b>{skipped}</b>")
+        lines.append("Обычно это старые посты, для которых бот еще не хранил данные шаблона.")
+    if failed:
+        lines.append(f"С ошибкой: <b>{failed}</b>")
+    return MessageTemplate("\n".join(lines))
 
 
 def deadline_cancelled_post(deadline: dict) -> MessageTemplate:
@@ -250,21 +279,12 @@ def cancelled() -> MessageTemplate:
     return MessageTemplate("Сценарий отменен.")
 
 
-def new_deadline_post(deadline: dict) -> MessageTemplate:
+def active_deadline_post(deadline: dict) -> MessageTemplate:
     return MessageTemplate(
-        f"{deadline['description_html']}\n\n- До: <b>{deadline['deadline_line_html']}</b>\n\n{EMOJIS['soon']}  #дедлайн"
-    )
-
-
-def reminder_7d_post(deadline: dict) -> MessageTemplate:
-    return MessageTemplate(
-        f"<b>Напоминание: до дедлайна 7 дней</b>\n{deadline['description_html']}\n{deadline['deadline_line_html']}\n\n{EMOJIS['soon']}  #дедлайн"
-    )
-
-
-def reminder_24h_post(deadline: dict) -> MessageTemplate:
-    return MessageTemplate(
-        f"<b>Напоминание: до дедлайна 24 часа</b>\n{deadline['description_html']}\n{deadline['deadline_line_html']}\n\n{EMOJIS['soon']}  #дедлайн"
+        f"{deadline['description_html']}\n\n"
+        f"{deadline['remaining_label_html']}: <b>{deadline['remaining_value']}</b>\n"
+        f"До: <b>{deadline['deadline_line_html']}</b>\n\n"
+        f"{EMOJIS['soon']}  #дедлайн"
     )
 
 
