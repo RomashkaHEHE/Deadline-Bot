@@ -616,6 +616,11 @@ def is_allowed(update: Update) -> bool:
     return bool(user and user.id in WHITELIST_USER_IDS)
 
 
+def is_private_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat and chat.type == "private")
+
+
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -648,6 +653,9 @@ async def reply(
 
 
 async def require_whitelist(update: Update) -> bool:
+    if not is_private_chat(update):
+        return False
+
     if is_allowed(update):
         return True
 
@@ -2037,21 +2045,22 @@ def build_application() -> Application:
         raise RuntimeError("WHITELIST_USER_IDS is empty. Add one or more Telegram user ids to .env.")
 
     application = Application.builder().token(BOT_TOKEN).build()
+    private_chat = filters.ChatType.PRIVATE
 
     create_conversation = ConversationHandler(
         entry_points=[
-            CommandHandler("new", create_start),
+            CommandHandler("new", create_start, filters=private_chat),
             CallbackQueryHandler(create_start, pattern=f"^{CREATE_FROM_LIST_CALLBACK}:"),
         ],
         states={
-            CREATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_description)],
-            CREATE_DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_datetime)],
+            CREATE_DESCRIPTION: [MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, create_description)],
+            CREATE_DATETIME: [MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, create_datetime)],
             CREATE_CONFIRM: [CallbackQueryHandler(create_confirm, pattern=f"^{IMMEDIATE_CALLBACK}:")],
         },
         fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", abort_conversation),
-            MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
+            CommandHandler("start", start, filters=private_chat),
+            CommandHandler("cancel", abort_conversation, filters=private_chat),
+            MessageHandler(private_chat & filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
         ],
     )
 
@@ -2060,14 +2069,14 @@ def build_application() -> Application:
             CallbackQueryHandler(edit_start, pattern=f"^{ACTION_CALLBACK}:{ACTION_EDIT}:"),
         ],
         states={
-            EDIT_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_description)],
-            EDIT_DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_datetime)],
+            EDIT_DESCRIPTION: [MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, edit_description)],
+            EDIT_DATETIME: [MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, edit_datetime)],
             EDIT_CONFIRM: [CallbackQueryHandler(edit_confirm, pattern=f"^{EDIT_IMMEDIATE_CALLBACK}:")],
         },
         fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", abort_conversation),
-            MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
+            CommandHandler("start", start, filters=private_chat),
+            CommandHandler("cancel", abort_conversation, filters=private_chat),
+            MessageHandler(private_chat & filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
         ],
     )
 
@@ -2076,21 +2085,21 @@ def build_application() -> Application:
             CallbackQueryHandler(cancel_start, pattern=f"^{ACTION_CALLBACK}:{ACTION_CANCEL}:"),
         ],
         states={
-            CANCEL_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, cancel_reason)],
+            CANCEL_REASON: [MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, cancel_reason)],
         },
         fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", abort_conversation),
-            MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
+            CommandHandler("start", start, filters=private_chat),
+            CommandHandler("cancel", abort_conversation, filters=private_chat),
+            MessageHandler(private_chat & filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
         ],
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("now", show_current_time))
-    application.add_handler(CommandHandler("list", show_visible_list))
-    application.add_handler(CommandHandler("archive", show_archive_list))
-    application.add_handler(CommandHandler("refresh_posts", refresh_channel_posts))
-    application.add_handler(CommandHandler("cancel", abort_conversation))
+    application.add_handler(CommandHandler("start", start, filters=private_chat))
+    application.add_handler(CommandHandler("now", show_current_time, filters=private_chat))
+    application.add_handler(CommandHandler("list", show_visible_list, filters=private_chat))
+    application.add_handler(CommandHandler("archive", show_archive_list, filters=private_chat))
+    application.add_handler(CommandHandler("refresh_posts", refresh_channel_posts, filters=private_chat))
+    application.add_handler(CommandHandler("cancel", abort_conversation, filters=private_chat))
     application.add_handler(create_conversation)
     application.add_handler(edit_conversation)
     application.add_handler(cancel_conversation)
@@ -2103,11 +2112,11 @@ def build_application() -> Application:
             pattern=f"^{ACTION_CALLBACK}:({ACTION_DELETE}|{ACTION_REMIND}):",
         )
     )
-    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_LIST}$"), show_visible_list))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_ARCHIVE}$"), show_archive_list))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_REFRESH_POSTS}$"), refresh_channel_posts))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
+    application.add_handler(MessageHandler(private_chat & filters.Regex(f"^{BUTTON_LIST}$"), show_visible_list))
+    application.add_handler(MessageHandler(private_chat & filters.Regex(f"^{BUTTON_ARCHIVE}$"), show_archive_list))
+    application.add_handler(MessageHandler(private_chat & filters.Regex(f"^{BUTTON_REFRESH_POSTS}$"), refresh_channel_posts))
+    application.add_handler(MessageHandler(private_chat & filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation))
+    application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, start))
 
     job_queue = application.job_queue
     if job_queue is None:
