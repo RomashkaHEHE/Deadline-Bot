@@ -6,18 +6,13 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class MessageTemplate:
     # Each template returns the exact payload that will be sent to Telegram.
-    # Keep channel-only footer text and HTML decisions here, not in app.py.
+    # Keep Telegram HTML and channel-only footer text here, not in app.py.
     text: str
     parse_mode: str | None = "HTML"
 
 
-BUTTON_NEW = "Добавить дедлайн"
 BUTTON_LIST = "Список дедлайнов"
 BUTTON_ARCHIVE = "Архив"
-BUTTON_EDIT = "Изменить дедлайн"
-BUTTON_CANCEL_DEADLINE = "Отменить дедлайн"
-BUTTON_DELETE_DEADLINE = "Удалить дедлайн"
-BUTTON_REMIND = "Напомнить о дедлайне"
 BUTTON_REFRESH_POSTS = "Обновить посты"
 BUTTON_SKIP = "Пропустить"
 BUTTON_ABORT = "Отмена"
@@ -33,7 +28,10 @@ def access_denied() -> MessageTemplate:
 
 
 def start_message() -> MessageTemplate:
-    return MessageTemplate("Выберите действие на клавиатуре ниже.")
+    return MessageTemplate(
+        "Выберите действие на клавиатуре ниже.\n"
+        "Новый дедлайн можно создать через <code>/new</code> или кнопкой внутри списка дедлайнов."
+    )
 
 
 def current_time_message(current_time: str, timezone_label: str) -> MessageTemplate:
@@ -42,8 +40,11 @@ def current_time_message(current_time: str, timezone_label: str) -> MessageTempl
     )
 
 
-def no_active_deadlines() -> MessageTemplate:
-    return MessageTemplate("Пока нет активных дедлайнов.")
+def no_visible_deadlines() -> MessageTemplate:
+    return MessageTemplate(
+        "В основном списке пока нет дедлайнов.\n"
+        "Создайте новый дедлайн кнопкой ниже или командой <code>/new</code>."
+    )
 
 
 def no_archive_deadlines() -> MessageTemplate:
@@ -52,6 +53,27 @@ def no_archive_deadlines() -> MessageTemplate:
 
 def no_channel_posts_to_refresh() -> MessageTemplate:
     return MessageTemplate("В канале пока нет сообщений, которые можно обновить.")
+
+
+def paginated_list_message(title: str, body: str, page: int, total_pages: int) -> MessageTemplate:
+    return MessageTemplate(
+        f"<b>{title}</b>\n"
+        f"Страница <b>{page}</b> / <b>{total_pages}</b>\n\n"
+        f"{body}"
+    )
+
+
+def deadline_card_message(title: str, body: str) -> MessageTemplate:
+    return MessageTemplate(f"<b>{title}</b>\n\n{body}")
+
+
+def deadline_details_message(title: str, body: str, history: str) -> MessageTemplate:
+    return MessageTemplate(
+        f"<b>{title}</b>\n\n"
+        f"{body}\n\n"
+        f"<b>История</b>\n"
+        f"{history}"
+    )
 
 
 def create_prompt_description() -> MessageTemplate:
@@ -91,35 +113,11 @@ def deadline_must_be_future() -> MessageTemplate:
     return MessageTemplate("Дедлайн должен быть в будущем.")
 
 
-def deadline_summary(deadline: dict) -> str:
-    return (
-        f"#{deadline['id']} • {deadline['description_html']}\n"
-        f"{deadline['deadline_line_html']}\n"
-        f"Автор: {deadline['created_by_name_html']}"
-    )
-
-
-def list_deadlines_message(items: list[dict]) -> MessageTemplate:
-    text = "\n\n".join(deadline_summary(item) for item in items)
-    return MessageTemplate(text)
-
-
-def archive_deadlines_message(items: list[dict]) -> MessageTemplate:
-    def archive_summary(deadline: dict) -> str:
-        return (
-            f"#{deadline['id']} • {deadline['description_html']}\n"
-            f"{deadline['deadline_line_html']}\n"
-            f"Статус: <b>{deadline['status_label_html']}</b>"
-        )
-
-    text = "\n\n".join(archive_summary(item) for item in items)
-    return MessageTemplate(text)
-
-
-def initial_publish_question(deadline: dict) -> MessageTemplate:
+def initial_publish_question(deadline_summary_html: str) -> MessageTemplate:
     return MessageTemplate(
-        "До дедлайна больше недели.\nОпубликовать первое сообщение сейчас?\n\n"
-        + deadline_summary(deadline)
+        "До дедлайна больше недели.\n"
+        "Опубликовать первое сообщение сейчас?\n\n"
+        f"{deadline_summary_html}"
     )
 
 
@@ -139,34 +137,6 @@ def deadline_saved_skip_initial() -> MessageTemplate:
 
 def deadline_missing() -> MessageTemplate:
     return MessageTemplate("Дедлайн уже не найден.")
-
-
-def choose_cancel_id(items: list[dict]) -> MessageTemplate:
-    text = "\n\n".join(deadline_summary(item) for item in items)
-    return MessageTemplate("Отправьте id дедлайна для отмены:\n\n" + text)
-
-
-def choose_delete_id(items: list[dict]) -> MessageTemplate:
-    text = "\n\n".join(deadline_summary(item) for item in items)
-    return MessageTemplate("Отправьте id дедлайна для удаления:\n\n" + text)
-
-
-def choose_edit_id(items: list[dict]) -> MessageTemplate:
-    text = "\n\n".join(deadline_summary(item) for item in items)
-    return MessageTemplate("Отправьте id дедлайна, который нужно изменить:\n\n" + text)
-
-
-def choose_remind_id(items: list[dict]) -> MessageTemplate:
-    text = "\n\n".join(deadline_summary(item) for item in items)
-    return MessageTemplate("Отправьте id дедлайна, о котором нужно напомнить:\n\n" + text)
-
-
-def numeric_id_required() -> MessageTemplate:
-    return MessageTemplate("Нужен числовой id дедлайна.")
-
-
-def deadline_not_found_by_id() -> MessageTemplate:
-    return MessageTemplate("Дедлайн с таким id не найден.")
 
 
 def deadline_cancelled_private() -> MessageTemplate:
@@ -189,16 +159,10 @@ def refreshed_channel_posts(updated: int, unchanged: int, skipped: int, failed: 
     ]
     if skipped:
         lines.append(f"Пропущено: <b>{skipped}</b>")
-        lines.append("Обычно это старые посты, для которых бот еще не хранил данные шаблона.")
+        lines.append("Обычно это старые посты, для которых бот еще не хранил структурированные данные шаблона.")
     if failed:
         lines.append(f"С ошибкой: <b>{failed}</b>")
     return MessageTemplate("\n".join(lines))
-
-
-def deadline_cancelled_post(deadline: dict) -> MessageTemplate:
-    return MessageTemplate(
-        f"{deadline['description_html']}\nотменён, отдыхаем\n\n{EMOJIS['soon']}  #дедлайн"
-    )
 
 
 def edit_prompt_description(deadline: dict) -> MessageTemplate:
@@ -224,16 +188,12 @@ def deadline_changed_post(changes: list[dict], old_deadline: dict, new_deadline:
     lines: list[str] = []
     for change in changes:
         if change["field"] == "description":
-            lines.append(
-                f"<s>{change['old_html']}</s>\n↓\n{change['new_html']}"
-            )
+            lines.append(f"<s>{change['old_html']}</s>\n↓\n{change['new_html']}")
         elif change["field"] == "deadline":
             lines.append(f"<s>{change['old_html']}</s> → {change['new_html']}")
 
     if not lines:
-        lines.append(
-            f"{old_deadline['description_html']}\n{new_deadline['deadline_line_html']}"
-        )
+        lines.append(f"{old_deadline['description_html']}\n{new_deadline['deadline_line_html']}")
     return MessageTemplate("\n".join(lines) + f"\n\n{EMOJIS['soon']}  #дедлайн")
 
 
@@ -288,13 +248,18 @@ def active_deadline_post(deadline: dict) -> MessageTemplate:
     )
 
 
-def deadline_completed_post(deadline: dict) -> MessageTemplate:
+def deadline_cancelled_post(deadline: dict) -> MessageTemplate:
     return MessageTemplate(
-        f"{deadline['description_html']}\n{deadline['deadline_line_html']}\n<b>дедлайн завершён</b>\n\n{EMOJIS['soon']}  #дедлайн"
+        f"{deadline['description_html']}\n"
+        "отменён, отдыхаем\n\n"
+        f"{EMOJIS['soon']}  #дедлайн"
     )
 
 
-def archive_cleanup_done(deadline: dict) -> MessageTemplate:
+def deadline_completed_post(deadline: dict) -> MessageTemplate:
     return MessageTemplate(
-        f"Все сообщения по дедлайну <b>{deadline['description_html']}</b> удалены, запись отправлена в архив."
+        f"{deadline['description_html']}\n"
+        f"{deadline['deadline_line_html']}\n"
+        "<b>дедлайн завершён</b>\n\n"
+        f"{EMOJIS['soon']}  #дедлайн"
     )

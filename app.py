@@ -1,6 +1,7 @@
 ﻿import asyncio
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -38,21 +39,30 @@ BASE_DIR = Path(__file__).resolve().parent
 STORAGE_PATH = Path(os.getenv("DEADLINES_STORAGE_PATH", BASE_DIR / "deadlines.json")).expanduser()
 
 CREATE_DESCRIPTION, CREATE_DATETIME, CREATE_CONFIRM = range(3)
-CANCEL_SELECT = 10
-DELETE_SELECT = 11
-REMIND_SELECT = 12
-EDIT_SELECT, EDIT_DESCRIPTION, EDIT_DATETIME, EDIT_CONFIRM = range(20, 24)
+EDIT_DESCRIPTION, EDIT_DATETIME, EDIT_CONFIRM = range(10, 13)
 
 IMMEDIATE_CALLBACK = "immediate_publish"
 EDIT_IMMEDIATE_CALLBACK = "edit_immediate_publish"
 
-BUTTON_NEW = msg.BUTTON_NEW
+LIST_CALLBACK = "ls"
+OPEN_CALLBACK = "op"
+DETAILS_CALLBACK = "dt"
+ACTION_CALLBACK = "ac"
+CREATE_FROM_LIST_CALLBACK = "cr"
+
+ACTION_EDIT = "ed"
+ACTION_CANCEL = "cn"
+ACTION_DELETE = "dl"
+ACTION_REMIND = "rm"
+
+SOURCE_VISIBLE = "visible"
+SOURCE_ARCHIVE = "archive"
+
+PAGE_SIZE = 6
+CURRENT_SCHEMA_VERSION = 2
+
 BUTTON_LIST = msg.BUTTON_LIST
 BUTTON_ARCHIVE = msg.BUTTON_ARCHIVE
-BUTTON_EDIT = msg.BUTTON_EDIT
-BUTTON_CANCEL_DEADLINE = msg.BUTTON_CANCEL_DEADLINE
-BUTTON_DELETE_DEADLINE = msg.BUTTON_DELETE_DEADLINE
-BUTTON_REMIND = msg.BUTTON_REMIND
 BUTTON_REFRESH_POSTS = msg.BUTTON_REFRESH_POSTS
 BUTTON_SKIP = msg.BUTTON_SKIP
 BUTTON_ABORT = msg.BUTTON_ABORT
@@ -65,6 +75,16 @@ STATUS_CANCELLED = "cancelled"
 STATUS_COMPLETED = "completed"
 STATUS_ARCHIVED = "archived"
 
+# The visible working list is broader than "active only": cancelled/completed
+# deadlines stay there until their channel messages are cleaned up and the item
+# is finally archived.
+STATUS_PRIORITY = {
+    STATUS_ACTIVE: 0,
+    STATUS_CANCELLED: 1,
+    STATUS_COMPLETED: 2,
+    STATUS_ARCHIVED: 3,
+}
+
 
 @dataclass
 class ChannelMessageRecord:
@@ -73,15 +93,20 @@ class ChannelMessageRecord:
     parse_mode: str | None
     kind: str
     created_at: str
-    # Structured data needed to rebuild this message with a newer template.
-    # Legacy records may have it empty; such posts are skipped during refresh.
     template_data: dict = field(default_factory=dict)
 
 
 @dataclass
+class DeadlineEvent:
+    kind: str
+    at: str
+    actor_id: int | None = None
+    actor_name: str | None = None
+    details: dict = field(default_factory=dict)
+
+
+@dataclass
 class Deadline:
-    # We keep both plain text and Telegram-renderable HTML so that the bot can
-    # preserve formatting from the original user message in channel posts.
     id: int
     description: str
     description_html: str
@@ -99,6 +124,7 @@ class Deadline:
     cleanup_after: str | None = None
     archived_at: str | None = None
     channel_messages: list[ChannelMessageRecord] = field(default_factory=list)
+    history: list[DeadlineEvent] = field(default_factory=list)
 
     @property
     def deadline_datetime(self) -> datetime:
@@ -110,78 +136,11 @@ class Deadline:
             return None
         return ensure_bot_timezone(datetime.fromisoformat(self.cleanup_after))
 
-
-class DeadlineStore:
-    # JSON file storage is the only persistence layer in this project.
-    # Schema changes should stay explicit and usually come with a one-time
-    # migration of the existing JSON file rather than permanent fallback code.
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._lock = asyncio.Lock()
-        self._deadlines: list[Deadline] = []
-        self._next_id = 1
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._load()
-
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
-        self._next_id = raw.get("next_id", 1)
-        deadlines: list[Deadline] = []
-        for item in raw.get("deadlines", []):
-            messages = [ChannelMessageRecord(**record) for record in item.get("channel_messages", [])]
-            payload = dict(item)
-            payload["channel_messages"] = messages
-            deadlines.append(Deadline(**payload))
-        self._deadlines = deadlines
-
-    async def _save(self) -> None:
-        payload = {
-            "next_id": self._next_id,
-            "deadlines": [asdict(item) for item in self._deadlines],
-        }
-        self.path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    async def add(self, deadline: Deadline) -> Deadline:
-        async with self._lock:
-            deadline.id = self._next_id
-            self._next_id += 1
-            self._deadlines.append(deadline)
-            await self._save()
-            return deadline
-
-    async def update(self, deadline: Deadline) -> None:
-        async with self._lock:
-            for index, item in enumerate(self._deadlines):
-                if item.id == deadline.id:
-                    self._deadlines[index] = deadline
-                    await self._save()
-                    return
-            raise KeyError(f"Deadline {deadline.id} not found")
-
-    def get(self, deadline_id: int) -> Deadline | None:
-        for item in self._deadlines:
-            if item.id == deadline_id:
-                return item
-        return None
-
-    def list_active(self) -> list[Deadline]:
-        items = [item for item in self._deadlines if item.status == STATUS_ACTIVE]
-        return sorted(items, key=lambda item: item.deadline_datetime)
-
-    def list_all(self) -> list[Deadline]:
-        return sorted(self._deadlines, key=lambda item: item.deadline_datetime)
-
-    def list_archive(self) -> list[Deadline]:
-        items = [item for item in self._deadlines if item.status != STATUS_ACTIVE]
-        return sorted(items, key=lambda item: item.deadline_datetime, reverse=True)
-
-
-STORE = DeadlineStore(STORAGE_PATH)
+    @property
+    def archived_at_datetime(self) -> datetime | None:
+        if not self.archived_at:
+            return None
+        return ensure_bot_timezone(datetime.fromisoformat(self.archived_at))
 
 
 def ensure_bot_timezone(value: datetime) -> datetime:
@@ -218,52 +177,14 @@ WHITELIST_USER_IDS = {
 }
 
 
-def is_allowed(update: Update) -> bool:
-    user = update.effective_user
-    return bool(user and user.id in WHITELIST_USER_IDS)
+def status_label(status: str) -> str:
+    return {
+        STATUS_ACTIVE: "активный",
+        STATUS_CANCELLED: "отменённый",
+        STATUS_COMPLETED: "завершённый",
+        STATUS_ARCHIVED: "архивный",
+    }.get(status, status)
 
-
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [BUTTON_NEW, BUTTON_EDIT],
-            [BUTTON_LIST, BUTTON_ARCHIVE],
-            [BUTTON_CANCEL_DEADLINE, BUTTON_DELETE_DEADLINE],
-            [BUTTON_REMIND, BUTTON_REFRESH_POSTS],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def input_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[BUTTON_ABORT]], resize_keyboard=True)
-
-
-def edit_input_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[BUTTON_SKIP], [BUTTON_ABORT]], resize_keyboard=True)
-
-
-async def reply(
-    message: Message,
-    template: msg.MessageTemplate,
-    *,
-    reply_markup: ReplyKeyboardMarkup | InlineKeyboardMarkup | None = None,
-) -> None:
-    await message.reply_text(
-        template.text,
-        parse_mode=template.parse_mode,
-        reply_markup=reply_markup,
-    )
-
-
-async def require_whitelist(update: Update) -> bool:
-    if is_allowed(update):
-        return True
-
-    message = update.effective_message
-    if message:
-        await reply(message, msg.access_denied())
-    return False
 
 def format_deadline_line(deadline_at: datetime, time_was_provided: bool) -> str:
     dt = ensure_bot_timezone(deadline_at)
@@ -273,41 +194,21 @@ def format_deadline_line(deadline_at: datetime, time_was_provided: bool) -> str:
     return date_part
 
 
-def format_deadline(deadline: Deadline) -> str:
-    return f"{deadline.description}\n{format_deadline_line(deadline.deadline_datetime, deadline.time_was_provided)}"
+def format_timestamp(raw_iso: str | None) -> str:
+    if not raw_iso:
+        return "неизвестно"
+    return ensure_bot_timezone(datetime.fromisoformat(raw_iso)).strftime("%d.%m.%Y %H:%M")
 
 
-def deadline_context(deadline: Deadline) -> dict:
-    # Templates in bot_messages.py work with a precomputed render context so the
-    # message file stays declarative and does not need to know model internals.
-    line = format_deadline_line(deadline.deadline_datetime, deadline.time_was_provided)
-    status_map = {
-        STATUS_ACTIVE: "активный",
-        STATUS_CANCELLED: "отменённый",
-        STATUS_COMPLETED: "завершённый",
-        STATUS_ARCHIVED: "архивный",
-    }
-    return {
-        "id": deadline.id,
-        "description": deadline.description,
-        "description_html": deadline.description_html,
-        "deadline_line": line,
-        "deadline_line_html": escape(line),
-        "formatted_deadline": format_deadline(deadline),
-        "formatted_deadline_html": escape(format_deadline(deadline)),
-        "created_by_name": deadline.created_by_name,
-        "created_by_name_html": escape(deadline.created_by_name),
-        "status": deadline.status,
-        "status_label": status_map.get(deadline.status, deadline.status),
-        "status_label_html": escape(status_map.get(deadline.status, deadline.status)),
-        "timezone_label": BOT_TIMEZONE_LABEL,
-        "deadline_iso": deadline.deadline_at,
-        "cleanup_after_iso": deadline.cleanup_after,
-    }
+def compact_text(value: str, limit: int) -> str:
+    flat = " ".join(value.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: max(0, limit - 1)].rstrip() + "…"
 
 
 def remaining_message_context(deadline_at: datetime) -> dict:
-    remaining = max(now_until(deadline_at), timedelta())
+    remaining = max(ensure_bot_timezone(deadline_at) - bot_now(), timedelta())
     total_seconds = int(remaining.total_seconds())
 
     if remaining > timedelta(days=1):
@@ -327,10 +228,33 @@ def remaining_message_context(deadline_at: datetime) -> dict:
     }
 
 
+def deadline_context(deadline: Deadline) -> dict:
+    line = format_deadline_line(deadline.deadline_datetime, deadline.time_was_provided)
+    return {
+        "id": deadline.id,
+        "description": deadline.description,
+        "description_html": deadline.description_html,
+        "description_preview_html": escape(compact_text(deadline.description, 70)),
+        "deadline_line": line,
+        "deadline_line_html": escape(line),
+        "created_by_name": deadline.created_by_name,
+        "created_by_name_html": escape(deadline.created_by_name),
+        "status": deadline.status,
+        "status_label": status_label(deadline.status),
+        "status_label_html": escape(status_label(deadline.status)),
+        "timezone_label": BOT_TIMEZONE_LABEL,
+        "deadline_iso": deadline.deadline_at,
+        "cleanup_after_iso": deadline.cleanup_after,
+        "archived_at_iso": deadline.archived_at,
+        "created_at_iso": deadline.created_at,
+        "channel_messages_count": len(deadline.channel_messages),
+    }
+
+
 def live_deadline_context(deadline: Deadline) -> dict:
-    context = deadline_context(deadline)
-    context.update(remaining_message_context(deadline.deadline_datetime))
-    return context
+    payload = deadline_context(deadline)
+    payload.update(remaining_message_context(deadline.deadline_datetime))
+    return payload
 
 
 def live_deadline_context_from_payload(payload: dict) -> dict:
@@ -368,36 +292,320 @@ def build_changes(old_deadline: Deadline, new_deadline: Deadline) -> list[dict]:
     return changes
 
 
-async def maybe_handle_menu_navigation(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> tuple[bool, int | None]:
-    message = update.effective_message
-    if message is None or not message.text:
-        return False, None
+def deadline_template_data(deadline: Deadline) -> dict:
+    return {"deadline": deadline_context(deadline)}
 
-    text = message.text.strip()
-    if text == BUTTON_ABORT:
-        return True, await abort_conversation(update, context)
-    if text == BUTTON_NEW:
-        return True, await create_start(update, context)
-    if text == BUTTON_LIST:
-        await list_deadlines(update, context)
-        return True, ConversationHandler.END
-    if text == BUTTON_ARCHIVE:
-        await list_archive(update, context)
-        return True, ConversationHandler.END
-    if text == BUTTON_EDIT:
-        return True, await edit_start(update, context)
-    if text == BUTTON_CANCEL_DEADLINE:
-        return True, await cancel_deadline_start(update, context)
-    if text == BUTTON_DELETE_DEADLINE:
-        return True, await delete_deadline_start(update, context)
-    if text == BUTTON_REMIND:
-        return True, await remind_deadline_start(update, context)
-    if text == BUTTON_REFRESH_POSTS:
-        await refresh_channel_posts(update, context)
-        return True, ConversationHandler.END
-    return False, None
+
+def live_deadline_template_data(deadline: Deadline) -> dict:
+    return {"deadline": live_deadline_context(deadline)}
+
+
+def changed_template_data(changes: list[dict], old_deadline: dict, new_deadline: dict) -> dict:
+    return {
+        "changes": changes,
+        "old_deadline": old_deadline,
+        "new_deadline": new_deadline,
+    }
+
+
+def make_event(
+    kind: str,
+    *,
+    at: str | None = None,
+    actor_id: int | None = None,
+    actor_name: str | None = None,
+    details: dict | None = None,
+) -> DeadlineEvent:
+    return DeadlineEvent(
+        kind=kind,
+        at=at or bot_now().isoformat(),
+        actor_id=actor_id,
+        actor_name=actor_name,
+        details=details or {},
+    )
+
+
+def add_history_event(
+    deadline: Deadline,
+    kind: str,
+    *,
+    at: str | None = None,
+    actor_id: int | None = None,
+    actor_name: str | None = None,
+    details: dict | None = None,
+) -> None:
+    deadline.history.append(
+        make_event(
+            kind,
+            at=at,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            details=details,
+        )
+    )
+
+
+def actor_from_update(update: Update) -> tuple[int | None, str | None]:
+    user = update.effective_user
+    if user is None:
+        return None, None
+    return user.id, user.full_name
+
+
+def legacy_context_from_item(item: dict) -> dict:
+    deadline_at = ensure_bot_timezone(datetime.fromisoformat(item["deadline_at"]))
+    line = format_deadline_line(deadline_at, item.get("time_was_provided", False))
+    status = item.get("status", STATUS_ACTIVE)
+    return {
+        "id": item["id"],
+        "description": item["description"],
+        "description_html": item.get("description_html", escape(item["description"])),
+        "description_preview_html": escape(compact_text(item["description"], 70)),
+        "deadline_line": line,
+        "deadline_line_html": escape(line),
+        "created_by_name": item.get("created_by_name", "неизвестно"),
+        "created_by_name_html": escape(item.get("created_by_name", "неизвестно")),
+        "status": status,
+        "status_label": status_label(status),
+        "status_label_html": escape(status_label(status)),
+        "timezone_label": BOT_TIMEZONE_LABEL,
+        "deadline_iso": item["deadline_at"],
+        "cleanup_after_iso": item.get("cleanup_after"),
+        "archived_at_iso": item.get("archived_at"),
+        "created_at_iso": item.get("created_at"),
+        "channel_messages_count": len(item.get("channel_messages", [])),
+    }
+
+
+def legacy_live_context_from_item(item: dict) -> dict:
+    payload = legacy_context_from_item(item)
+    payload.update(remaining_message_context(datetime.fromisoformat(item["deadline_at"])))
+    return payload
+
+
+def legacy_template_data_for_kind(item: dict, kind: str) -> dict:
+    if kind in {"initial", "reminder_7d", "reminder_24h", "reminder_manual"}:
+        return {"deadline": legacy_live_context_from_item(item)}
+    if kind in {"cancelled", "completed"}:
+        return {"deadline": legacy_context_from_item(item)}
+    return {}
+
+
+def migrate_storage(raw: dict, version: int) -> dict:
+    if version != 1:
+        raise RuntimeError(f"Unsupported storage schema version: {version}")
+
+    # Migrations rewrite old JSON into the current schema once at load time, so
+    # the rest of the runtime can work with one clean data shape.
+    migrated_deadlines: list[dict] = []
+    for item in raw.get("deadlines", []):
+        payload = dict(item)
+        payload.setdefault("description_html", escape(payload["description"]))
+        payload.setdefault("immediate_publish_skipped", False)
+        payload.setdefault("initial_published", False)
+        payload.setdefault("reminded_7d", False)
+        payload.setdefault("reminded_24h", False)
+        payload.setdefault("status", STATUS_ACTIVE)
+        payload.setdefault("cleanup_after", None)
+        payload.setdefault("archived_at", None)
+
+        created_at = payload.get("created_at") or bot_now().isoformat()
+        payload["created_at"] = created_at
+
+        history = payload.get("history") or []
+        if not history:
+            history.append(
+                asdict(
+                    make_event(
+                        "created",
+                        at=created_at,
+                        actor_id=payload.get("created_by"),
+                        actor_name=payload.get("created_by_name"),
+                    )
+                )
+            )
+
+            if payload["status"] == STATUS_CANCELLED and payload.get("cleanup_after"):
+                cancelled_at = (
+                    ensure_bot_timezone(datetime.fromisoformat(payload["cleanup_after"])) - timedelta(days=3)
+                ).isoformat()
+                history.append(asdict(make_event("cancelled", at=cancelled_at)))
+
+            if payload["status"] == STATUS_COMPLETED and payload.get("cleanup_after"):
+                completed_at = (
+                    ensure_bot_timezone(datetime.fromisoformat(payload["cleanup_after"])) - timedelta(days=3)
+                ).isoformat()
+                history.append(asdict(make_event("completed", at=completed_at, actor_name="бот")))
+
+            if payload["status"] == STATUS_ARCHIVED:
+                archived_at = payload.get("archived_at") or created_at
+                payload["archived_at"] = archived_at
+                history.append(asdict(make_event("archived", at=archived_at, actor_name="бот", details={"reason": "legacy"})))
+
+        payload["history"] = history
+
+        migrated_messages = []
+        for record in payload.get("channel_messages", []):
+            migrated_record = dict(record)
+            migrated_record.setdefault(
+                "template_data",
+                legacy_template_data_for_kind(payload, migrated_record.get("kind", "")),
+            )
+            migrated_messages.append(migrated_record)
+        payload["channel_messages"] = migrated_messages
+        migrated_deadlines.append(payload)
+
+    return {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "next_id": raw.get("next_id", 1),
+        "deadlines": migrated_deadlines,
+    }
+
+class DeadlineStore:
+    # JSON remains the persistence layer, but it is now schema-versioned and
+    # migratable so server-side state can evolve safely without manual resets.
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = asyncio.Lock()
+        self._deadlines: list[Deadline] = []
+        self._next_id = 1
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._load()
+
+    def _serialize(self) -> dict:
+        return {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "next_id": self._next_id,
+            "deadlines": [asdict(item) for item in self._deadlines],
+        }
+
+    def _write_sync(self) -> None:
+        self.path.write_text(
+            json.dumps(self._serialize(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        version = int(raw.get("schema_version", 1))
+        migrated = False
+        while version < CURRENT_SCHEMA_VERSION:
+            raw = migrate_storage(raw, version)
+            version = raw["schema_version"]
+            migrated = True
+
+        self._next_id = raw.get("next_id", 1)
+        deadlines: list[Deadline] = []
+        for item in raw.get("deadlines", []):
+            messages = [ChannelMessageRecord(**record) for record in item.get("channel_messages", [])]
+            history = [DeadlineEvent(**event) for event in item.get("history", [])]
+            payload = dict(item)
+            payload["channel_messages"] = messages
+            payload["history"] = history
+            deadlines.append(Deadline(**payload))
+        self._deadlines = deadlines
+
+        if migrated:
+            self._write_sync()
+
+    async def _save(self) -> None:
+        self._write_sync()
+
+    async def add(self, deadline: Deadline) -> Deadline:
+        async with self._lock:
+            deadline.id = self._next_id
+            self._next_id += 1
+            self._deadlines.append(deadline)
+            await self._save()
+            return deadline
+
+    async def update(self, deadline: Deadline) -> None:
+        async with self._lock:
+            for index, item in enumerate(self._deadlines):
+                if item.id == deadline.id:
+                    self._deadlines[index] = deadline
+                    await self._save()
+                    return
+            raise KeyError(f"Deadline {deadline.id} not found")
+
+    def get(self, deadline_id: int) -> Deadline | None:
+        for item in self._deadlines:
+            if item.id == deadline_id:
+                return item
+        return None
+
+    def list_visible(self) -> list[Deadline]:
+        # Visible list intentionally includes active + recently cancelled /
+        # completed deadlines until cleanup removes their channel traces.
+        items = [item for item in self._deadlines if item.status != STATUS_ARCHIVED]
+        return sorted(items, key=lambda item: (STATUS_PRIORITY.get(item.status, 99), item.deadline_datetime, item.id))
+
+    def list_archive(self) -> list[Deadline]:
+        items = [item for item in self._deadlines if item.status == STATUS_ARCHIVED]
+        return sorted(
+            items,
+            key=lambda item: (item.archived_at_datetime or item.deadline_datetime, item.id),
+            reverse=True,
+        )
+
+    def list_all(self) -> list[Deadline]:
+        return sorted(self._deadlines, key=lambda item: (item.deadline_datetime, item.id))
+
+
+STORE = DeadlineStore(STORAGE_PATH)
+
+
+def is_allowed(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and user.id in WHITELIST_USER_IDS)
+
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [BUTTON_LIST, BUTTON_ARCHIVE],
+            [BUTTON_REFRESH_POSTS],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def input_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[BUTTON_ABORT]], resize_keyboard=True)
+
+
+def edit_input_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[BUTTON_SKIP], [BUTTON_ABORT]], resize_keyboard=True)
+
+
+async def reply(
+    message: Message,
+    template: msg.MessageTemplate,
+    *,
+    reply_markup: ReplyKeyboardMarkup | InlineKeyboardMarkup | None = None,
+) -> None:
+    await message.reply_text(
+        template.text,
+        parse_mode=template.parse_mode,
+        reply_markup=reply_markup,
+    )
+
+
+async def require_whitelist(update: Update) -> bool:
+    if is_allowed(update):
+        return True
+
+    if update.callback_query:
+        await update.callback_query.answer(msg.access_denied().text, show_alert=True)
+        return False
+
+    message = update.effective_message
+    if message:
+        await reply(message, msg.access_denied())
+    return False
 
 
 def parse_deadline_input(raw_text: str) -> tuple[datetime, bool, bool]:
@@ -414,7 +622,6 @@ def parse_deadline_input(raw_text: str) -> tuple[datetime, bool, bool]:
         raise ValueError(msg.invalid_date_value().text) from exc
 
     deadline_date = date_value.replace(tzinfo=BOT_TIMEZONE)
-
     time_was_provided = len(parts) == 2
     time_was_explicit_midnight = False
 
@@ -440,30 +647,386 @@ def now_until(deadline_at: datetime) -> timedelta:
     return ensure_bot_timezone(deadline_at) - bot_now()
 
 
-def deadline_template_data(deadline: Deadline) -> dict:
-    return {"deadline": deadline_context(deadline)}
+def deadline_summary_html(deadline: Deadline) -> str:
+    context = deadline_context(deadline)
+    return (
+        f"<b>#{context['id']}</b> • {context['description_preview_html']}\n"
+        f"Срок: <b>{context['deadline_line_html']}</b>\n"
+        f"Автор: {context['created_by_name_html']}"
+    )
 
 
-def live_deadline_template_data(deadline: Deadline) -> dict:
-    return {"deadline": live_deadline_context(deadline)}
+def source_title(source: str) -> str:
+    if source == SOURCE_ARCHIVE:
+        return "Архив"
+    return "Список дедлайнов"
 
 
-def changed_template_data(changes: list[dict], old_deadline: dict, new_deadline: dict) -> dict:
+def source_for_deadline(deadline: Deadline) -> str:
+    return SOURCE_ARCHIVE if deadline.status == STATUS_ARCHIVED else SOURCE_VISIBLE
+
+
+def clamp_page(page: int, total_pages: int) -> int:
+    if total_pages <= 1:
+        return 0
+    return max(0, min(page, total_pages - 1))
+
+
+def paginate_items(items: list[Deadline], page: int) -> tuple[list[Deadline], int, int]:
+    total_pages = max(1, math.ceil(len(items) / PAGE_SIZE)) if items else 1
+    page = clamp_page(page, total_pages)
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    return items[start:end], page, total_pages
+
+
+def callback_list(source: str, page: int) -> str:
+    return f"{LIST_CALLBACK}:{source}:{page}"
+
+
+def callback_open(source: str, page: int, deadline_id: int) -> str:
+    return f"{OPEN_CALLBACK}:{source}:{page}:{deadline_id}"
+
+
+def callback_details(source: str, page: int, deadline_id: int) -> str:
+    return f"{DETAILS_CALLBACK}:{source}:{page}:{deadline_id}"
+
+
+def callback_action(action: str, source: str, page: int, deadline_id: int) -> str:
+    return f"{ACTION_CALLBACK}:{action}:{source}:{page}:{deadline_id}"
+
+
+def callback_create(source: str, page: int) -> str:
+    return f"{CREATE_FROM_LIST_CALLBACK}:{source}:{page}"
+
+def list_body_items(items: list[Deadline]) -> str:
+    if not items:
+        return "Здесь пока ничего нет."
+
+    blocks: list[str] = []
+    for deadline in items:
+        context = deadline_context(deadline)
+        lines = [
+            f"<b>#{context['id']}</b> • {context['description_preview_html']}",
+            f"Статус: <b>{context['status_label_html']}</b>",
+            f"Срок: <b>{context['deadline_line_html']}</b>",
+        ]
+        if deadline.status in {STATUS_CANCELLED, STATUS_COMPLETED} and deadline.cleanup_after:
+            lines.append(f"Очистка сообщений: <b>{escape(format_timestamp(deadline.cleanup_after))}</b>")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def deadline_button_label(deadline: Deadline) -> str:
+    prefix = {
+        STATUS_ACTIVE: "",
+        STATUS_CANCELLED: "[отм] ",
+        STATUS_COMPLETED: "[зав] ",
+        STATUS_ARCHIVED: "[арх] ",
+    }.get(deadline.status, "")
+    date_label = deadline.deadline_datetime.strftime("%d.%m")
+    return compact_text(f"{prefix}#{deadline.id} • {date_label} • {deadline.description}", 64)
+
+
+def build_list_keyboard(source: str, page_items: list[Deadline], page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for deadline in page_items:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    deadline_button_label(deadline),
+                    callback_data=callback_open(source, page, deadline.id),
+                )
+            ]
+        )
+
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("← Назад", callback_data=callback_list(source, page - 1)))
+    if page + 1 < total_pages:
+        navigation.append(InlineKeyboardButton("Вперёд →", callback_data=callback_list(source, page + 1)))
+    if navigation:
+        rows.append(navigation)
+
+    if source == SOURCE_VISIBLE:
+        rows.append([InlineKeyboardButton("Добавить дедлайн", callback_data=callback_create(source, page))])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def build_list_screen(source: str, page: int) -> tuple[msg.MessageTemplate, InlineKeyboardMarkup]:
+    items = STORE.list_archive() if source == SOURCE_ARCHIVE else STORE.list_visible()
+    page_items, actual_page, total_pages = paginate_items(items, page)
+
+    if not items:
+        template = msg.no_archive_deadlines() if source == SOURCE_ARCHIVE else msg.no_visible_deadlines()
+        keyboard = build_list_keyboard(source, [], actual_page, total_pages)
+        return template, keyboard
+
+    template = msg.paginated_list_message(
+        source_title(source),
+        list_body_items(page_items),
+        actual_page + 1,
+        total_pages,
+    )
+    keyboard = build_list_keyboard(source, page_items, actual_page, total_pages)
+    return template, keyboard
+
+
+def build_deadline_card_body(deadline: Deadline) -> str:
+    context = deadline_context(deadline)
+    lines = [
+        context["description_html"],
+        "",
+        f"Статус: <b>{context['status_label_html']}</b>",
+        f"Срок: <b>{context['deadline_line_html']}</b>",
+        f"Сообщений в канале: <b>{context['channel_messages_count']}</b>",
+    ]
+    if deadline.status == STATUS_ACTIVE:
+        live_context = live_deadline_context(deadline)
+        lines.append(f"{live_context['remaining_label_html']}: <b>{live_context['remaining_value']}</b>")
+    if deadline.status in {STATUS_CANCELLED, STATUS_COMPLETED} and deadline.cleanup_after:
+        lines.append(f"Очистка сообщений: <b>{escape(format_timestamp(deadline.cleanup_after))}</b>")
+    if deadline.status == STATUS_ARCHIVED and deadline.archived_at:
+        lines.append(f"Архивирован: <b>{escape(format_timestamp(deadline.archived_at))}</b>")
+    return "\n".join(lines)
+
+
+def build_deadline_card_keyboard(deadline: Deadline, source: str, page: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if source != SOURCE_ARCHIVE and deadline.status == STATUS_ACTIVE:
+        rows.append(
+            [
+                InlineKeyboardButton("Изменить", callback_data=callback_action(ACTION_EDIT, source, page, deadline.id)),
+                InlineKeyboardButton("Напомнить", callback_data=callback_action(ACTION_REMIND, source, page, deadline.id)),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton("Отменить", callback_data=callback_action(ACTION_CANCEL, source, page, deadline.id)),
+                InlineKeyboardButton("Удалить", callback_data=callback_action(ACTION_DELETE, source, page, deadline.id)),
+            ]
+        )
+    elif source != SOURCE_ARCHIVE:
+        rows.append(
+            [InlineKeyboardButton("Удалить", callback_data=callback_action(ACTION_DELETE, source, page, deadline.id))]
+        )
+
+    rows.append([InlineKeyboardButton("Подробности", callback_data=callback_details(source, page, deadline.id))])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "← К списку" if source == SOURCE_VISIBLE else "← К архиву",
+                callback_data=callback_list(source, page),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_deadline_card_screen(deadline: Deadline, source: str, page: int) -> tuple[msg.MessageTemplate, InlineKeyboardMarkup]:
+    template = msg.deadline_card_message(
+        f"Дедлайн #{deadline.id}",
+        build_deadline_card_body(deadline),
+    )
+    return template, build_deadline_card_keyboard(deadline, source, page)
+
+
+def change_history_lines(changes: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for change in changes:
+        if change["field"] == "description":
+            old_value = escape(compact_text(change["old"], 120))
+            new_value = escape(compact_text(change["new"], 120))
+            lines.append(f"описание: <code>{old_value}</code> → <code>{new_value}</code>")
+        elif change["field"] == "deadline":
+            old_value = escape(change["old"])
+            new_value = escape(change["new"])
+            lines.append(f"дата: <code>{old_value}</code> → <code>{new_value}</code>")
+    return lines
+
+
+def render_history_entry(event: DeadlineEvent) -> str:
+    timestamp = escape(format_timestamp(event.at))
+    actor = escape(event.actor_name or "бот")
+
+    if event.kind == "created":
+        return f"• <b>{timestamp}</b> — {actor} создал дедлайн"
+    if event.kind == "initial_skipped":
+        return f"• <b>{timestamp}</b> — {actor} пропустил первую публикацию"
+    if event.kind == "published":
+        source = event.details.get("source", "initial")
+        source_label = {
+            "initial": "опубликовал дедлайн в канал",
+            "edit_publish": "опубликовал обновленный дедлайн в канал",
+        }.get(source, "опубликовал дедлайн в канал")
+        return f"• <b>{timestamp}</b> — {actor} {source_label}"
+    if event.kind == "reminded":
+        source = event.details.get("source", "manual")
+        source_label = {
+            "reminder_7d": "бот отправил напоминание за 7 дней",
+            "reminder_24h": "бот отправил напоминание за 24 часа",
+            "reminder_manual": f"{actor} отправил ручное напоминание",
+        }.get(source, f"{actor} отправил напоминание")
+        return f"• <b>{timestamp}</b> — {source_label}"
+    if event.kind == "changed":
+        lines = [f"• <b>{timestamp}</b> — {actor} изменил дедлайн"]
+        for line in change_history_lines(event.details.get("changes", [])):
+            lines.append(f"  {line}")
+        return "\n".join(lines)
+    if event.kind == "cancelled":
+        return f"• <b>{timestamp}</b> — {actor} отменил дедлайн"
+    if event.kind == "completed":
+        return f"• <b>{timestamp}</b> — дедлайн завершён"
+    if event.kind == "deleted":
+        return f"• <b>{timestamp}</b> — {actor} удалил дедлайн из списка и отправил в архив"
+    if event.kind == "archived":
+        reason = event.details.get("reason", "archive")
+        reason_label = {
+            "cleanup": "после очистки сообщений",
+            "delete": "по команде удаления",
+            "legacy": "после миграции данных",
+        }.get(reason, "при переносе в архив")
+        return f"• <b>{timestamp}</b> — дедлайн попал в архив {reason_label}"
+    return f"• <b>{timestamp}</b> — {actor} выполнил действие <code>{escape(event.kind)}</code>"
+
+
+def render_history(deadline: Deadline, max_chars: int = 3200) -> str:
+    if not deadline.history:
+        return "История пока пуста."
+
+    entries = [render_history_entry(event) for event in reversed(deadline.history)]
+    collected: list[str] = []
+    remaining = 0
+    for index, entry in enumerate(entries):
+        candidate = "\n\n".join(collected + [entry])
+        if len(candidate) > max_chars:
+            remaining = len(entries) - index
+            break
+        collected.append(entry)
+
+    if remaining:
+        collected.append(f"… ещё {remaining} событий не показано.")
+    return "\n\n".join(collected)
+
+
+def build_deadline_details_body(deadline: Deadline) -> str:
+    context = deadline_context(deadline)
+    lines = [
+        context["description_html"],
+        "",
+        f"Статус: <b>{context['status_label_html']}</b>",
+        f"Срок: <b>{context['deadline_line_html']}</b>",
+        f"Создан: <b>{escape(format_timestamp(deadline.created_at))}</b>",
+        f"Автор: <b>{context['created_by_name_html']}</b>",
+        f"Сообщений в канале: <b>{context['channel_messages_count']}</b>",
+        f"Записей в истории: <b>{len(deadline.history)}</b>",
+    ]
+
+    if deadline.status == STATUS_ACTIVE:
+        live_context = live_deadline_context(deadline)
+        lines.append(f"{live_context['remaining_label_html']}: <b>{live_context['remaining_value']}</b>")
+    if deadline.cleanup_after:
+        lines.append(f"Очистка сообщений: <b>{escape(format_timestamp(deadline.cleanup_after))}</b>")
+    if deadline.archived_at:
+        lines.append(f"Архивирован: <b>{escape(format_timestamp(deadline.archived_at))}</b>")
+    return "\n".join(lines)
+
+
+def build_deadline_details_keyboard(deadline: Deadline, source: str, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("← К дедлайну", callback_data=callback_open(source_for_deadline(deadline), page, deadline.id))],
+            [InlineKeyboardButton("← К списку" if source == SOURCE_VISIBLE else "← К архиву", callback_data=callback_list(source, page))],
+        ]
+    )
+
+
+def build_deadline_details_screen(deadline: Deadline, source: str, page: int) -> tuple[msg.MessageTemplate, InlineKeyboardMarkup]:
+    template = msg.deadline_details_message(
+        f"Подробности дедлайна #{deadline.id}",
+        build_deadline_details_body(deadline),
+        render_history(deadline),
+    )
+    return template, build_deadline_details_keyboard(deadline, source, page)
+
+
+async def send_list_screen(message: Message, source: str, page: int = 0) -> None:
+    template, keyboard = build_list_screen(source, page)
+    await reply(message, template, reply_markup=keyboard)
+
+
+async def edit_query_screen(query, template: msg.MessageTemplate, keyboard: InlineKeyboardMarkup) -> None:
+    try:
+        await query.edit_message_text(
+            template.text,
+            parse_mode=template.parse_mode,
+            reply_markup=keyboard,
+        )
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+async def update_message_screen(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    template: msg.MessageTemplate,
+    keyboard: InlineKeyboardMarkup,
+) -> None:
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=template.text,
+            parse_mode=template.parse_mode,
+            reply_markup=keyboard,
+        )
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            LOGGER.warning("Failed to update message %s in chat %s: %s", message_id, chat_id, exc)
+    except Exception as exc:
+        LOGGER.warning("Failed to update message %s in chat %s: %s", message_id, chat_id, exc)
+
+
+def remember_screen_origin(query, source: str, page: int) -> dict:
+    # When a conversation starts from an inline screen, remember that message so
+    # we can refresh the original list/card after the flow finishes.
     return {
-        "changes": changes,
-        "old_deadline": old_deadline,
-        "new_deadline": new_deadline,
+        "source": source,
+        "page": page,
+        "chat_id": query.message.chat_id if query.message else None,
+        "message_id": query.message.message_id if query.message else None,
     }
 
 
+async def sync_create_origin(context: ContextTypes.DEFAULT_TYPE) -> None:
+    origin = context.user_data.get("create_origin")
+    if not origin:
+        return
+    template, keyboard = build_list_screen(origin["source"], origin["page"])
+    await update_message_screen(context, origin["chat_id"], origin["message_id"], template, keyboard)
+
+
+async def sync_edit_origin(context: ContextTypes.DEFAULT_TYPE, deadline: Deadline) -> None:
+    origin = context.user_data.get("edit_origin")
+    if not origin:
+        return
+
+    source = source_for_deadline(deadline)
+    page = origin["page"] if source == origin["source"] else 0
+    template, keyboard = build_deadline_card_screen(deadline, source, page)
+    await update_message_screen(context, origin["chat_id"], origin["message_id"], template, keyboard)
+
 def render_channel_template(record: ChannelMessageRecord) -> msg.MessageTemplate:
-    # Refreshing channel posts must use the same structured payload that was
-    # stored when the post was first created, otherwise old reminders/changes
-    # could silently turn into messages about the current state instead.
     data = record.template_data
     if not data:
         raise ValueError("legacy channel message without template data")
 
+    # Channel posts are rebuilt from structured template_data rather than from
+    # their stored text so message templates can evolve later via refresh.
     if record.kind in {"initial", "reminder_7d", "reminder_24h", "reminder_manual"}:
         return msg.active_deadline_post(live_deadline_context_from_payload(data["deadline"]))
     if record.kind == "cancelled":
@@ -483,10 +1046,6 @@ async def post_channel_template(
     kind: str,
     template_data: dict,
 ) -> Message:
-    # Every deadline-related channel post must go through this helper so we can
-    # later edit or delete the full message history for that deadline.
-    # We also persist template_data here, because retroactive refresh must
-    # rebuild old posts from structured data rather than by mutating raw text.
     sent = await context.bot.send_message(
         chat_id=CHANNEL_ID,
         text=template.text,
@@ -507,16 +1066,25 @@ async def post_channel_template(
     return sent
 
 
+async def delete_all_deadline_messages(context: ContextTypes.DEFAULT_TYPE, deadline: Deadline) -> None:
+    for record in list(deadline.channel_messages):
+        try:
+            await context.bot.delete_message(chat_id=CHANNEL_ID, message_id=record.message_id)
+        except Exception as exc:
+            LOGGER.warning("Failed to delete message %s for deadline %s: %s", record.message_id, deadline.id, exc)
+    deadline.channel_messages = []
+    await STORE.update(deadline)
+
+
 async def publish_live_deadline_post(
     context: ContextTypes.DEFAULT_TYPE,
     deadline: Deadline,
     *,
     kind: str,
     replace_existing: bool,
+    actor_id: int | None = None,
+    actor_name: str | None = None,
 ) -> None:
-    # The channel should keep only one "current state" post for an active
-    # deadline. Auto reminders and manual reminders therefore replace older
-    # posts instead of appending another copy of the same deadline.
     if replace_existing:
         await delete_all_deadline_messages(context, deadline)
 
@@ -529,46 +1097,22 @@ async def publish_live_deadline_post(
         template_data=template_data,
     )
     deadline.initial_published = True
-    await STORE.update(deadline)
-
-
-async def delete_all_deadline_messages(context: ContextTypes.DEFAULT_TYPE, deadline: Deadline) -> None:
-    for record in list(deadline.channel_messages):
-        try:
-            await context.bot.delete_message(chat_id=CHANNEL_ID, message_id=record.message_id)
-        except Exception as exc:
-            LOGGER.warning("Failed to delete message %s for deadline %s: %s", record.message_id, deadline.id, exc)
-    deadline.channel_messages = []
-    await STORE.update(deadline)
-
-
-async def mark_deadline_completed(context: ContextTypes.DEFAULT_TYPE, deadline: Deadline) -> None:
-    if deadline.status != STATUS_ACTIVE:
-        return
-
-    deadline.status = STATUS_COMPLETED
-    deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
-    completed_template_data = deadline_template_data(deadline)
-
-    if deadline.channel_messages:
-        # Product choice: completion does not create a new post. Instead we edit
-        # the latest deadline-related channel message and schedule cleanup.
-        last_record = deadline.channel_messages[-1]
-        template = msg.deadline_completed_post(completed_template_data["deadline"])
-        try:
-            await context.bot.edit_message_text(
-                chat_id=CHANNEL_ID,
-                message_id=last_record.message_id,
-                text=template.text,
-                parse_mode=template.parse_mode,
-            )
-            last_record.text = template.text
-            last_record.parse_mode = template.parse_mode
-            last_record.kind = "completed"
-            last_record.template_data = completed_template_data
-        except Exception as exc:
-            LOGGER.warning("Failed to edit completion message for deadline %s: %s", deadline.id, exc)
-
+    if kind == "initial":
+        add_history_event(
+            deadline,
+            "published",
+            actor_id=actor_id,
+            actor_name=actor_name,
+            details={"source": "initial"},
+        )
+    else:
+        add_history_event(
+            deadline,
+            "reminded",
+            actor_id=actor_id,
+            actor_name=actor_name,
+            details={"source": kind},
+        )
     await STORE.update(deadline)
 
 
@@ -577,9 +1121,18 @@ async def maybe_send_initial_publication(
     deadline: Deadline,
     *,
     force: bool,
+    actor_id: int | None = None,
+    actor_name: str | None = None,
 ) -> None:
     if now_until(deadline.deadline_datetime) <= timedelta(days=7) or force:
-        await publish_live_deadline_post(context, deadline, kind="initial", replace_existing=False)
+        await publish_live_deadline_post(
+            context,
+            deadline,
+            kind="initial",
+            replace_existing=False,
+            actor_id=actor_id,
+            actor_name=actor_name,
+        )
 
 
 async def align_reminder_flags(deadline: Deadline) -> None:
@@ -591,10 +1144,105 @@ async def align_reminder_flags(deadline: Deadline) -> None:
     await STORE.update(deadline)
 
 
+async def cancel_deadline(
+    context: ContextTypes.DEFAULT_TYPE,
+    deadline: Deadline,
+    *,
+    actor_id: int | None = None,
+    actor_name: str | None = None,
+) -> None:
+    deadline.status = STATUS_CANCELLED
+    deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
+    add_history_event(deadline, "cancelled", actor_id=actor_id, actor_name=actor_name)
+    await STORE.update(deadline)
+
+    template_data = deadline_template_data(deadline)
+    await post_channel_template(
+        context,
+        deadline,
+        msg.deadline_cancelled_post(template_data["deadline"]),
+        kind="cancelled",
+        template_data=template_data,
+    )
+
+
+async def delete_deadline(
+    context: ContextTypes.DEFAULT_TYPE,
+    deadline: Deadline,
+    *,
+    actor_id: int | None = None,
+    actor_name: str | None = None,
+) -> None:
+    await delete_all_deadline_messages(context, deadline)
+    deadline.status = STATUS_ARCHIVED
+    deadline.archived_at = bot_now().isoformat()
+    deadline.cleanup_after = None
+    add_history_event(deadline, "deleted", actor_id=actor_id, actor_name=actor_name)
+    add_history_event(deadline, "archived", actor_name="бот", details={"reason": "delete"})
+    await STORE.update(deadline)
+
+
+async def remind_deadline(
+    context: ContextTypes.DEFAULT_TYPE,
+    deadline: Deadline,
+    *,
+    actor_id: int | None = None,
+    actor_name: str | None = None,
+) -> None:
+    await publish_live_deadline_post(
+        context,
+        deadline,
+        kind="reminder_manual",
+        replace_existing=True,
+        actor_id=actor_id,
+        actor_name=actor_name,
+    )
+    await align_reminder_flags(deadline)
+
+
+async def mark_deadline_completed(context: ContextTypes.DEFAULT_TYPE, deadline: Deadline) -> None:
+    if deadline.status != STATUS_ACTIVE:
+        return
+
+    deadline.status = STATUS_COMPLETED
+    deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
+    add_history_event(deadline, "completed", actor_name="бот")
+
+    if deadline.channel_messages:
+        last_record = deadline.channel_messages[-1]
+        template_data = deadline_template_data(deadline)
+        template = msg.deadline_completed_post(template_data["deadline"])
+        try:
+            await context.bot.edit_message_text(
+                chat_id=CHANNEL_ID,
+                message_id=last_record.message_id,
+                text=template.text,
+                parse_mode=template.parse_mode,
+            )
+            last_record.text = template.text
+            last_record.parse_mode = template.parse_mode
+            last_record.kind = "completed"
+            last_record.template_data = template_data
+        except Exception as exc:
+            LOGGER.warning("Failed to edit completion message for deadline %s: %s", deadline.id, exc)
+
+    await STORE.update(deadline)
+
+
+async def archive_after_cleanup(context: ContextTypes.DEFAULT_TYPE, deadline: Deadline) -> None:
+    await delete_all_deadline_messages(context, deadline)
+    deadline.status = STATUS_ARCHIVED
+    deadline.archived_at = bot_now().isoformat()
+    deadline.cleanup_after = None
+    add_history_event(deadline, "archived", actor_name="бот", details={"reason": "cleanup"})
+    await STORE.update(deadline)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_whitelist(update):
         return ConversationHandler.END
-    await reply(update.message, msg.start_message(), reply_markup=main_keyboard())
+    context.user_data.clear()
+    await reply(update.effective_message, msg.start_message(), reply_markup=main_keyboard())
     return ConversationHandler.END
 
 
@@ -603,38 +1251,22 @@ async def show_current_time(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     current_time = bot_now().strftime("%d.%m.%Y %H:%M")
     await reply(
-        update.message,
+        update.effective_message,
         msg.current_time_message(current_time, BOT_TIMEZONE_LABEL),
         reply_markup=main_keyboard(),
     )
 
 
-async def list_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_visible_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_whitelist(update):
         return
-    deadlines = STORE.list_active()
-    if not deadlines:
-        await reply(update.message, msg.no_active_deadlines(), reply_markup=main_keyboard())
-        return
-    await reply(
-        update.message,
-        msg.list_deadlines_message([deadline_context(item) for item in deadlines]),
-        reply_markup=main_keyboard(),
-    )
+    await send_list_screen(update.effective_message, SOURCE_VISIBLE, page=0)
 
 
-async def list_archive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_archive_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_whitelist(update):
         return
-    deadlines = STORE.list_archive()
-    if not deadlines:
-        await reply(update.message, msg.no_archive_deadlines(), reply_markup=main_keyboard())
-        return
-    await reply(
-        update.message,
-        msg.archive_deadlines_message([deadline_context(item) for item in deadlines]),
-        reply_markup=main_keyboard(),
-    )
+    await send_list_screen(update.effective_message, SOURCE_ARCHIVE, page=0)
 
 
 async def refresh_channel_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -644,7 +1276,7 @@ async def refresh_channel_posts(update: Update, context: ContextTypes.DEFAULT_TY
     all_deadlines = STORE.list_all()
     total_messages = sum(len(deadline.channel_messages) for deadline in all_deadlines)
     if total_messages == 0:
-        await reply(update.message, msg.no_channel_posts_to_refresh(), reply_markup=main_keyboard())
+        await reply(update.effective_message, msg.no_channel_posts_to_refresh(), reply_markup=main_keyboard())
         return
 
     updated = 0
@@ -713,53 +1345,48 @@ async def refresh_channel_posts(update: Update, context: ContextTypes.DEFAULT_TY
             await STORE.update(deadline)
 
     await reply(
-        update.message,
+        update.effective_message,
         msg.refreshed_channel_posts(updated, unchanged, skipped, failed),
         reply_markup=main_keyboard(),
     )
 
 
-async def remind_deadline_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not await require_whitelist(update):
-        return ConversationHandler.END
-    deadlines = STORE.list_active()
-    if not deadlines:
-        await reply(update.message, msg.no_active_deadlines(), reply_markup=main_keyboard())
-        return ConversationHandler.END
-    await reply(
-        update.message,
-        msg.choose_remind_id([deadline_context(item) for item in deadlines]),
-        reply_markup=input_keyboard(),
-    )
-    return REMIND_SELECT
+async def maybe_handle_menu_navigation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[bool, int | None]:
+    message = update.effective_message
+    if message is None or not message.text:
+        return False, None
 
-
-async def remind_deadline_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    handled, next_state = await maybe_handle_menu_navigation(update, context)
-    if handled:
-        return next_state if next_state is not None else ConversationHandler.END
-
-    try:
-        deadline_id = int(update.message.text.strip())
-    except ValueError:
-        await reply(update.message, msg.numeric_id_required(), reply_markup=input_keyboard())
-        return REMIND_SELECT
-
-    deadline = STORE.get(deadline_id)
-    if deadline is None or deadline.status != STATUS_ACTIVE:
-        await reply(update.message, msg.deadline_not_found_by_id(), reply_markup=input_keyboard())
-        return REMIND_SELECT
-
-    await publish_live_deadline_post(context, deadline, kind="reminder_manual", replace_existing=True)
-    await align_reminder_flags(deadline)
-    await reply(update.message, msg.deadline_reminded_private(), reply_markup=main_keyboard())
-    return ConversationHandler.END
+    text = message.text.strip()
+    if text == BUTTON_ABORT:
+        return True, await abort_conversation(update, context)
+    if text == BUTTON_LIST:
+        await show_visible_list(update, context)
+        return True, ConversationHandler.END
+    if text == BUTTON_ARCHIVE:
+        await show_archive_list(update, context)
+        return True, ConversationHandler.END
+    if text == BUTTON_REFRESH_POSTS:
+        await refresh_channel_posts(update, context)
+        return True, ConversationHandler.END
+    return False, None
 
 
 async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_whitelist(update):
         return ConversationHandler.END
-    await reply(update.message, msg.create_prompt_description(), reply_markup=input_keyboard())
+
+    context.user_data.pop("create_origin", None)
+    target = update.effective_message
+    query = update.callback_query
+    if query:
+        await query.answer()
+        _, source, raw_page = query.data.split(":")
+        context.user_data["create_origin"] = remember_screen_origin(query, source, int(raw_page))
+        target = query.message
+
+    await reply(target, msg.create_prompt_description(), reply_markup=input_keyboard())
     return CREATE_DESCRIPTION
 
 
@@ -789,6 +1416,7 @@ async def create_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await reply(update.message, msg.MessageTemplate(str(exc)), reply_markup=input_keyboard())
         return CREATE_DATETIME
 
+    actor_id, actor_name = actor_from_update(update)
     deadline = Deadline(
         id=0,
         description=context.user_data["new_description"],
@@ -800,25 +1428,37 @@ async def create_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         created_by_name=update.effective_user.full_name,
         created_at=bot_now().isoformat(),
     )
+    add_history_event(deadline, "created", actor_id=actor_id, actor_name=actor_name, at=deadline.created_at)
     saved = await STORE.add(deadline)
 
     if now_until(deadline_at) > timedelta(days=7):
         keyboard = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("Опубликовать", callback_data=f"{IMMEDIATE_CALLBACK}:yes:{saved.id}"),
-                InlineKeyboardButton("Не публиковать", callback_data=f"{IMMEDIATE_CALLBACK}:no:{saved.id}"),
-            ]]
+            [
+                [
+                    InlineKeyboardButton("Опубликовать", callback_data=f"{IMMEDIATE_CALLBACK}:yes:{saved.id}"),
+                    InlineKeyboardButton("Не публиковать", callback_data=f"{IMMEDIATE_CALLBACK}:no:{saved.id}"),
+                ]
+            ]
         )
-        await reply(update.message, msg.initial_publish_question(deadline_context(saved)), reply_markup=keyboard)
+        await reply(update.message, msg.initial_publish_question(deadline_summary_html(saved)), reply_markup=keyboard)
         return CREATE_CONFIRM
 
-    await maybe_send_initial_publication(context, saved, force=False)
+    await maybe_send_initial_publication(
+        context,
+        saved,
+        force=False,
+        actor_id=actor_id,
+        actor_name=actor_name,
+    )
     await align_reminder_flags(saved)
     await reply(update.message, msg.deadline_saved_and_published(), reply_markup=main_keyboard())
+    await sync_create_origin(context)
     return ConversationHandler.END
 
-
 async def create_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await require_whitelist(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
     _, answer, raw_id = query.data.split(":")
@@ -828,148 +1468,52 @@ async def create_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(template.text, parse_mode=template.parse_mode)
         return ConversationHandler.END
 
+    actor_id, actor_name = actor_from_update(update)
     if answer == "yes":
-        await maybe_send_initial_publication(context, deadline, force=True)
+        await maybe_send_initial_publication(
+            context,
+            deadline,
+            force=True,
+            actor_id=actor_id,
+            actor_name=actor_name,
+        )
         template = msg.deadline_saved_and_published_now()
     else:
         deadline.immediate_publish_skipped = True
+        add_history_event(deadline, "initial_skipped", actor_id=actor_id, actor_name=actor_name)
         await STORE.update(deadline)
         template = msg.deadline_saved_skip_initial()
+
     await align_reminder_flags(deadline)
     await query.edit_message_text(template.text, parse_mode=template.parse_mode)
     if query.message:
         await reply(query.message, msg.start_message(), reply_markup=main_keyboard())
+    await sync_create_origin(context)
     return ConversationHandler.END
 
-
-async def cancel_deadline_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not await require_whitelist(update):
-        return ConversationHandler.END
-    deadlines = STORE.list_active()
-    if not deadlines:
-        await reply(update.message, msg.no_active_deadlines(), reply_markup=main_keyboard())
-        return ConversationHandler.END
-    await reply(
-        update.message,
-        msg.choose_cancel_id([deadline_context(item) for item in deadlines]),
-        reply_markup=input_keyboard(),
-    )
-    return CANCEL_SELECT
-
-
-async def cancel_deadline_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    handled, next_state = await maybe_handle_menu_navigation(update, context)
-    if handled:
-        return next_state if next_state is not None else ConversationHandler.END
-
-    try:
-        deadline_id = int(update.message.text.strip())
-    except ValueError:
-        await reply(update.message, msg.numeric_id_required(), reply_markup=input_keyboard())
-        return CANCEL_SELECT
-
-    deadline = STORE.get(deadline_id)
-    if deadline is None or deadline.status != STATUS_ACTIVE:
-        await reply(update.message, msg.deadline_not_found_by_id(), reply_markup=input_keyboard())
-        return CANCEL_SELECT
-
-    deadline.status = STATUS_CANCELLED
-    # Cancelled deadlines stay in archive history, but their channel posts are
-    # removed only after the 3-day cleanup window.
-    deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
-    await STORE.update(deadline)
-    template_data = deadline_template_data(deadline)
-    await post_channel_template(
-        context,
-        deadline,
-        msg.deadline_cancelled_post(template_data["deadline"]),
-        kind="cancelled",
-        template_data=template_data,
-    )
-    await reply(update.message, msg.deadline_cancelled_private(), reply_markup=main_keyboard())
-    return ConversationHandler.END
-
-
-async def delete_deadline_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not await require_whitelist(update):
-        return ConversationHandler.END
-    deadlines = STORE.list_active()
-    if not deadlines:
-        await reply(update.message, msg.no_active_deadlines(), reply_markup=main_keyboard())
-        return ConversationHandler.END
-    await reply(
-        update.message,
-        msg.choose_delete_id([deadline_context(item) for item in deadlines]),
-        reply_markup=input_keyboard(),
-    )
-    return DELETE_SELECT
-
-
-async def delete_deadline_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    handled, next_state = await maybe_handle_menu_navigation(update, context)
-    if handled:
-        return next_state if next_state is not None else ConversationHandler.END
-
-    try:
-        deadline_id = int(update.message.text.strip())
-    except ValueError:
-        await reply(update.message, msg.numeric_id_required(), reply_markup=input_keyboard())
-        return DELETE_SELECT
-
-    deadline = STORE.get(deadline_id)
-    if deadline is None or deadline.status != STATUS_ACTIVE:
-        await reply(update.message, msg.deadline_not_found_by_id(), reply_markup=input_keyboard())
-        return DELETE_SELECT
-
-    # Manual delete is stronger than cancel: remove all channel traces now and
-    # move the deadline directly into archive state.
-    await delete_all_deadline_messages(context, deadline)
-    deadline.status = STATUS_ARCHIVED
-    deadline.archived_at = bot_now().isoformat()
-    deadline.cleanup_after = None
-    await STORE.update(deadline)
-    await reply(update.message, msg.deadline_deleted_private(), reply_markup=main_keyboard())
-    return ConversationHandler.END
 
 async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_whitelist(update):
         return ConversationHandler.END
-    deadlines = STORE.list_active()
-    if not deadlines:
-        await reply(update.message, msg.no_active_deadlines(), reply_markup=main_keyboard())
-        return ConversationHandler.END
-    await reply(
-        update.message,
-        msg.choose_edit_id([deadline_context(item) for item in deadlines]),
-        reply_markup=input_keyboard(),
-    )
-    return EDIT_SELECT
 
-
-async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    handled, next_state = await maybe_handle_menu_navigation(update, context)
-    if handled:
-        return next_state if next_state is not None else ConversationHandler.END
-
-    try:
-        deadline_id = int(update.message.text.strip())
-    except ValueError:
-        await reply(update.message, msg.numeric_id_required(), reply_markup=input_keyboard())
-        return EDIT_SELECT
-
-    deadline = STORE.get(deadline_id)
+    query = update.callback_query
+    await query.answer()
+    _, _, source, raw_page, raw_id = query.data.split(":")
+    deadline = STORE.get(int(raw_id))
     if deadline is None or deadline.status != STATUS_ACTIVE:
-        await reply(update.message, msg.deadline_not_found_by_id(), reply_markup=input_keyboard())
-        return EDIT_SELECT
+        template = msg.deadline_missing()
+        await query.edit_message_text(template.text, parse_mode=template.parse_mode)
+        return ConversationHandler.END
 
-    context.user_data["edit_deadline_id"] = deadline_id
+    context.user_data["edit_deadline_id"] = deadline.id
     context.user_data["edit_original_description"] = deadline.description
     context.user_data["edit_original_description_html"] = deadline.description_html
     context.user_data["edit_original_deadline_at"] = deadline.deadline_at
     context.user_data["edit_original_time_was_provided"] = deadline.time_was_provided
     context.user_data["edit_original_time_was_explicit_midnight"] = deadline.time_was_explicit_midnight
+    context.user_data["edit_origin"] = remember_screen_origin(query, source, int(raw_page))
     await reply(
-        update.message,
+        query.message,
         msg.edit_prompt_description(deadline_context(deadline)),
         reply_markup=edit_input_keyboard(),
     )
@@ -1033,8 +1577,13 @@ async def edit_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     had_any_publication = bool(deadline.channel_messages)
     old_payload = asdict(deadline)
     old_payload["channel_messages"] = [asdict(item) for item in deadline.channel_messages]
+    old_payload["history"] = [asdict(item) for item in deadline.history]
     old_deadline = Deadline(
-        **{**old_payload, "channel_messages": [ChannelMessageRecord(**record) for record in old_payload["channel_messages"]]}
+        **{
+            **old_payload,
+            "channel_messages": [ChannelMessageRecord(**record) for record in old_payload["channel_messages"]],
+            "history": [DeadlineEvent(**event) for event in old_payload["history"]],
+        }
     )
 
     deadline.description = new_description
@@ -1047,6 +1596,14 @@ async def edit_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     deadline.cleanup_after = None
 
     changes = build_changes(old_deadline, deadline)
+    actor_id, actor_name = actor_from_update(update)
+    add_history_event(
+        deadline,
+        "changed",
+        actor_id=actor_id,
+        actor_name=actor_name,
+        details={"changes": changes},
+    )
     context.user_data["edit_changes"] = changes
     context.user_data["edit_old_context"] = deadline_context(old_deadline)
     context.user_data["edit_new_context"] = deadline_context(deadline)
@@ -1066,16 +1623,25 @@ async def edit_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             )
             await reply(update.message, msg.deadline_changed_notice(), reply_markup=main_keyboard())
         else:
-            await maybe_send_initial_publication(context, deadline, force=False)
+            await maybe_send_initial_publication(
+                context,
+                deadline,
+                force=False,
+                actor_id=actor_id,
+                actor_name=actor_name,
+            )
             await reply(update.message, msg.deadline_changed_actual_published(), reply_markup=main_keyboard())
+        await sync_edit_origin(context, deadline)
         return ConversationHandler.END
 
     await STORE.update(deadline)
     keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Опубликовать", callback_data=f"{EDIT_IMMEDIATE_CALLBACK}:yes:{deadline.id}"),
-            InlineKeyboardButton("Не публиковать", callback_data=f"{EDIT_IMMEDIATE_CALLBACK}:no:{deadline.id}"),
-        ]]
+        [
+            [
+                InlineKeyboardButton("Опубликовать", callback_data=f"{EDIT_IMMEDIATE_CALLBACK}:yes:{deadline.id}"),
+                InlineKeyboardButton("Не публиковать", callback_data=f"{EDIT_IMMEDIATE_CALLBACK}:no:{deadline.id}"),
+            ]
+        ]
     )
     question = msg.edit_publish_question_with_change() if had_any_publication else msg.edit_publish_question_without_change()
     context.user_data["edit_had_any_publication"] = had_any_publication
@@ -1084,6 +1650,9 @@ async def edit_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await require_whitelist(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
     _, answer, raw_id = query.data.split(":")
@@ -1097,12 +1666,19 @@ async def edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     changes = context.user_data.get("edit_changes", [])
     old_context = context.user_data.get("edit_old_context", deadline_context(deadline))
     new_context = deadline_context(deadline)
+    actor_id, actor_name = actor_from_update(update)
 
     if answer == "yes":
         deadline.initial_published = False
         deadline.immediate_publish_skipped = False
         await STORE.update(deadline)
-        await maybe_send_initial_publication(context, deadline, force=True)
+        await maybe_send_initial_publication(
+            context,
+            deadline,
+            force=True,
+            actor_id=actor_id,
+            actor_name=actor_name,
+        )
         template = msg.edit_saved_with_change_and_publish() if had_any_publication else msg.edit_saved_published()
     else:
         deadline.immediate_publish_skipped = True
@@ -1122,17 +1698,107 @@ async def edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await query.edit_message_text(template.text, parse_mode=template.parse_mode)
     if query.message:
         await reply(query.message, msg.start_message(), reply_markup=main_keyboard())
+    await sync_edit_origin(context, deadline)
     return ConversationHandler.END
 
+
+async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_whitelist(update):
+        return
+
+    query = update.callback_query
+    await query.answer()
+    _, source, raw_page = query.data.split(":")
+    template, keyboard = build_list_screen(source, int(raw_page))
+    await edit_query_screen(query, template, keyboard)
+
+
+async def open_deadline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_whitelist(update):
+        return
+
+    query = update.callback_query
+    await query.answer()
+    _, source, raw_page, raw_id = query.data.split(":")
+    deadline = STORE.get(int(raw_id))
+    if deadline is None:
+        template = msg.deadline_missing()
+        await query.edit_message_text(template.text, parse_mode=template.parse_mode)
+        return
+
+    actual_source = source_for_deadline(deadline)
+    page = int(raw_page) if actual_source == source else 0
+    template, keyboard = build_deadline_card_screen(deadline, actual_source, page)
+    await edit_query_screen(query, template, keyboard)
+
+
+async def details_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_whitelist(update):
+        return
+
+    query = update.callback_query
+    await query.answer()
+    _, source, raw_page, raw_id = query.data.split(":")
+    deadline = STORE.get(int(raw_id))
+    if deadline is None:
+        template = msg.deadline_missing()
+        await query.edit_message_text(template.text, parse_mode=template.parse_mode)
+        return
+
+    actual_source = source_for_deadline(deadline)
+    page = int(raw_page) if actual_source == source else 0
+    template, keyboard = build_deadline_details_screen(deadline, actual_source, page)
+    await edit_query_screen(query, template, keyboard)
+
+
+async def deadline_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_whitelist(update):
+        return
+
+    query = update.callback_query
+    await query.answer()
+    _, action, source, raw_page, raw_id = query.data.split(":")
+    deadline = STORE.get(int(raw_id))
+    if deadline is None:
+        template = msg.deadline_missing()
+        await query.edit_message_text(template.text, parse_mode=template.parse_mode)
+        return
+
+    page = int(raw_page)
+    actor_id, actor_name = actor_from_update(update)
+
+    if action == ACTION_REMIND:
+        if deadline.status != STATUS_ACTIVE:
+            await query.answer("Напоминание доступно только для активного дедлайна.", show_alert=True)
+            return
+        await remind_deadline(context, deadline, actor_id=actor_id, actor_name=actor_name)
+        template, keyboard = build_deadline_card_screen(deadline, SOURCE_VISIBLE, page)
+        await edit_query_screen(query, template, keyboard)
+        return
+
+    if action == ACTION_CANCEL:
+        if deadline.status != STATUS_ACTIVE:
+            await query.answer("Отмена доступна только для активного дедлайна.", show_alert=True)
+            return
+        await cancel_deadline(context, deadline, actor_id=actor_id, actor_name=actor_name)
+        template, keyboard = build_deadline_card_screen(deadline, SOURCE_VISIBLE, page)
+        await edit_query_screen(query, template, keyboard)
+        return
+
+    if action == ACTION_DELETE:
+        await delete_deadline(context, deadline, actor_id=actor_id, actor_name=actor_name)
+        template, keyboard = build_deadline_card_screen(deadline, SOURCE_ARCHIVE, 0)
+        await edit_query_screen(query, template, keyboard)
+        return
 
 async def abort_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await reply(update.message, msg.cancelled(), reply_markup=main_keyboard())
+    await reply(update.effective_message, msg.cancelled(), reply_markup=main_keyboard())
     return ConversationHandler.END
 
+
 async def reminder_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
-    # One repeating loop handles both reminder delivery and delayed cleanup.
-    # This keeps scheduling logic in a single place and makes restart behavior
-    # deterministic: after restart, the loop simply reconciles current state.
+    # One repeating loop handles reminders and delayed cleanup. After restart the
+    # loop simply reconciles current state, so there are no in-memory schedules.
     for deadline in STORE.list_all():
         if deadline.status == STATUS_ACTIVE:
             remaining = now_until(deadline.deadline_datetime)
@@ -1141,12 +1807,24 @@ async def reminder_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             if not deadline.reminded_7d and remaining <= timedelta(days=7):
-                await publish_live_deadline_post(context, deadline, kind="reminder_7d", replace_existing=True)
+                await publish_live_deadline_post(
+                    context,
+                    deadline,
+                    kind="reminder_7d",
+                    replace_existing=True,
+                    actor_name="бот",
+                )
                 deadline.reminded_7d = True
                 await STORE.update(deadline)
 
             if not deadline.reminded_24h and remaining <= timedelta(hours=24):
-                await publish_live_deadline_post(context, deadline, kind="reminder_24h", replace_existing=True)
+                await publish_live_deadline_post(
+                    context,
+                    deadline,
+                    kind="reminder_24h",
+                    replace_existing=True,
+                    actor_name="бот",
+                )
                 deadline.reminded_24h = True
                 await STORE.update(deadline)
             continue
@@ -1154,11 +1832,7 @@ async def reminder_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
         if deadline.status in {STATUS_CANCELLED, STATUS_COMPLETED}:
             cleanup_at = deadline.cleanup_after_datetime
             if cleanup_at and bot_now() >= cleanup_at:
-                await delete_all_deadline_messages(context, deadline)
-                deadline.status = STATUS_ARCHIVED
-                deadline.archived_at = bot_now().isoformat()
-                deadline.cleanup_after = None
-                await STORE.update(deadline)
+                await archive_after_cleanup(context, deadline)
 
 
 def build_application() -> Application:
@@ -1170,7 +1844,7 @@ def build_application() -> Application:
     create_conversation = ConversationHandler(
         entry_points=[
             CommandHandler("new", create_start),
-            MessageHandler(filters.Regex(f"^{BUTTON_NEW}$"), create_start),
+            CallbackQueryHandler(create_start, pattern=f"^{CREATE_FROM_LIST_CALLBACK}:"),
         ],
         states={
             CREATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_description)],
@@ -1184,52 +1858,11 @@ def build_application() -> Application:
         ],
     )
 
-    cancel_deadline_conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("cancel_deadline", cancel_deadline_start),
-            MessageHandler(filters.Regex(f"^{BUTTON_CANCEL_DEADLINE}$"), cancel_deadline_start),
-        ],
-        states={CANCEL_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cancel_deadline_finish)]},
-        fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", abort_conversation),
-            MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
-        ],
-    )
-
-    delete_deadline_conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("delete", delete_deadline_start),
-            MessageHandler(filters.Regex(f"^{BUTTON_DELETE_DEADLINE}$"), delete_deadline_start),
-        ],
-        states={DELETE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_deadline_finish)]},
-        fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", abort_conversation),
-            MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
-        ],
-    )
-
-    remind_deadline_conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("remind", remind_deadline_start),
-            MessageHandler(filters.Regex(f"^{BUTTON_REMIND}$"), remind_deadline_start),
-        ],
-        states={REMIND_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, remind_deadline_finish)]},
-        fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", abort_conversation),
-            MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
-        ],
-    )
-
     edit_conversation = ConversationHandler(
         entry_points=[
-            CommandHandler("edit", edit_start),
-            MessageHandler(filters.Regex(f"^{BUTTON_EDIT}$"), edit_start),
+            CallbackQueryHandler(edit_start, pattern=f"^{ACTION_CALLBACK}:{ACTION_EDIT}:"),
         ],
         states={
-            EDIT_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_select)],
             EDIT_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_description)],
             EDIT_DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_datetime)],
             EDIT_CONFIRM: [CallbackQueryHandler(edit_confirm, pattern=f"^{EDIT_IMMEDIATE_CALLBACK}:")],
@@ -1243,17 +1876,23 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("now", show_current_time))
-    application.add_handler(CommandHandler("list", list_deadlines))
-    application.add_handler(CommandHandler("archive", list_archive))
+    application.add_handler(CommandHandler("list", show_visible_list))
+    application.add_handler(CommandHandler("archive", show_archive_list))
     application.add_handler(CommandHandler("refresh_posts", refresh_channel_posts))
     application.add_handler(CommandHandler("cancel", abort_conversation))
     application.add_handler(create_conversation)
-    application.add_handler(cancel_deadline_conversation)
-    application.add_handler(delete_deadline_conversation)
-    application.add_handler(remind_deadline_conversation)
     application.add_handler(edit_conversation)
-    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_LIST}$"), list_deadlines))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_ARCHIVE}$"), list_archive))
+    application.add_handler(CallbackQueryHandler(list_page_callback, pattern=f"^{LIST_CALLBACK}:"))
+    application.add_handler(CallbackQueryHandler(open_deadline_callback, pattern=f"^{OPEN_CALLBACK}:"))
+    application.add_handler(CallbackQueryHandler(details_callback, pattern=f"^{DETAILS_CALLBACK}:"))
+    application.add_handler(
+        CallbackQueryHandler(
+            deadline_action_callback,
+            pattern=f"^{ACTION_CALLBACK}:({ACTION_CANCEL}|{ACTION_DELETE}|{ACTION_REMIND}):",
+        )
+    )
+    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_LIST}$"), show_visible_list))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_ARCHIVE}$"), show_archive_list))
     application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_REFRESH_POSTS}$"), refresh_channel_posts))
     application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))

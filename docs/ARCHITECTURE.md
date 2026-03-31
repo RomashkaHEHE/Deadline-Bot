@@ -2,101 +2,130 @@
 
 ## Purpose
 
-`Deadline Bot` is a Telegram bot for a study group. It lets trusted users create, edit, cancel, delete, and archive deadlines, and it posts deadline updates into a Telegram channel.
+`Deadline Bot` is a Telegram bot for a study group. Trusted users create deadlines, the bot publishes deadline posts into a Telegram channel or topic, tracks every related message, keeps a change history, and gradually moves finished items into archive.
 
-The project is intentionally simple:
+The project intentionally stays small:
 
-- one main runtime file: `app.py`
-- one message-template file: `bot_messages.py`
-- one standalone utility bot: `tools.py`
-- one JSON file for persistence: `deadlines.json` or the path from `DEADLINES_STORAGE_PATH`
+- one main runtime: `app.py`
+- one message-template module: `bot_messages.py`
+- one utility bot: `tools.py`
+- one JSON storage file
 
-There is no database and no web server. The bot runs via Telegram polling.
+There is no database and no web server. The bot works through Telegram polling plus the `python-telegram-bot` job queue.
 
 ## Main Modules
 
 ### `app.py`
 
-The main bot runtime. It is responsible for:
+Owns the runtime logic:
 
-- loading environment variables
-- loading and saving deadlines
-- building Telegram keyboards and conversation flows
-- parsing user input
-- posting messages into the channel
-- tracking posted channel messages
-- replacing older active-deadline posts with one fresh reminder post
-- editing the latest channel message when a deadline completes
-- deleting all deadline-related channel messages after the cleanup window
-- serving archive and active lists
+- environment loading
+- JSON loading and migration
+- Telegram conversations and inline navigation
+- paginated list and archive screens
+- deadline cards and details screens
+- posting, editing, deleting and refreshing channel messages
+- reminder scheduling and delayed cleanup
 
 ### `bot_messages.py`
 
-Central place for all bot-facing message templates and button labels.
+Contains every user-facing and channel-facing message template.
 
-Important design choice:
+Important design rule:
 
-- templates return complete Telegram-ready messages
-- channel-specific footer text is defined directly inside channel-message templates
-- HTML formatting is controlled here, not injected later in `app.py`
+- templates return the exact Telegram payload that should be sent
+- HTML formatting lives here
+- channel-only footer text also lives here
+- reusable custom emoji snippets live in `EMOJIS`
 
-This file is the first place to edit if the wording, formatting, emoji, or visual style of the bot should change.
+If a message looks wrong, this file is usually the first place to edit.
 
 ### `tools.py`
 
-A separate helper bot script that uses the same token, but is meant for one-off tooling tasks.
+A separate helper bot for one-off Telegram inspection.
 
-Right now it is used to inspect incoming message payloads and extract things like:
+It is intentionally isolated from production logic and can be used to inspect:
 
 - `text_html`
 - Telegram entities
 - `custom_emoji_id`
+- `message_thread_id`
+- topic-related message metadata
 
-Because it also uses polling, it should not run at the same time as `app.py`.
+Because it uses polling too, it should not run at the same time as `app.py`.
 
-## Persistence Model
+## Storage Model
 
-The only persistence layer is the JSON file defined by:
+The persistent file is selected like this:
 
-- `DEADLINES_STORAGE_PATH`, if present
+- `DEADLINES_STORAGE_PATH`, if set
 - otherwise `deadlines.json` next to `app.py`
 
-The file stores:
+The file is schema-versioned through `schema_version`.
 
-- the next numeric deadline id
-- a list of deadlines
+Top-level structure:
+
+- `schema_version`
+- `next_id`
+- `deadlines`
 
 Each deadline stores:
 
-- plain description text
-- HTML version of the description from Telegram entities
+- text description
+- HTML-safe description as received from Telegram formatting
 - deadline datetime
-- whether the time was explicitly provided
-- whether `00:00` was explicitly provided
-- author metadata
-- publish/reminder flags
+- time flags
+- creator metadata
+- publication/reminder flags
 - lifecycle status
 - cleanup timestamp
 - archive timestamp
-- all channel messages tied to the deadline
+- tracked channel messages
+- event history
 
 Each channel message record stores:
 
-- Telegram `message_id`
-- exact text sent to Telegram
+- `message_id`
+- the exact text sent to Telegram
 - `parse_mode`
-- semantic kind, for example `initial`, `reminder_7d`, `changed`
+- semantic `kind`
 - creation time
-- `template_data` with the structured payload needed to rebuild that post later
+- `template_data`
+
+`template_data` matters because it lets the bot rebuild old channel posts after template changes. That is what powers `Обновить посты`.
+
+## Migration Strategy
+
+The runtime does not try to support every historical JSON shape forever.
+
+Instead:
+
+1. the bot reads `schema_version`
+2. it applies one-time migrations until the current schema is reached
+3. it rewrites the JSON file in the new format
+
+That approach keeps runtime code clean while still allowing server data to evolve in place.
+
+If the schema changes again, add a new migration step in `migrate_storage(...)` and bump `CURRENT_SCHEMA_VERSION`.
 
 ## Deadline Lifecycle
 
-The system has four statuses:
+There are four statuses:
 
 - `active`
 - `cancelled`
 - `completed`
 - `archived`
+
+### Visible List
+
+The main list intentionally shows every deadline that is not archived:
+
+- active deadlines
+- cancelled deadlines whose messages are still waiting for cleanup
+- completed deadlines whose messages are still waiting for cleanup
+
+This is important: archive is not “everything inactive”, archive is “everything fully removed from the working surface”.
 
 ### Active
 
@@ -104,146 +133,150 @@ An active deadline:
 
 - appears in the main list
 - can be edited
+- can be reminded manually
 - can be cancelled
-- can be manually deleted into archive
-- can be manually reminded
-- participates in reminder scheduling
-- keeps at most one current "live" post in the channel; each reminder replaces older active posts
+- can be deleted into archive
+- participates in automatic reminder scheduling
+
+Channel-wise, it keeps only one current live deadline post. Each new reminder replaces older live posts.
 
 ### Cancelled
 
-When a deadline is cancelled:
+When cancelled:
 
-- it leaves the active list immediately
-- the bot posts a separate cancellation message into the channel
-- all historical channel messages remain visible for 3 more days
-- after 3 days, every channel message tied to that deadline is deleted
-- the deadline then moves to `archived`
+- the deadline stays in the visible list with cancelled status
+- the bot sends a separate cancellation post
+- all related channel messages remain for 3 days
+- after cleanup, all related channel messages are deleted
+- only then does the deadline move to archive
 
 ### Completed
 
 When the deadline moment arrives:
 
-- the bot does not send a new completion message
-- instead, it edits the most recent channel message for that deadline
-- then it schedules cleanup 3 days later
+- the bot does not send a new completion post
+- it edits the most recent tracked channel message
+- cleanup is scheduled for 3 days later
 - after cleanup, all related channel messages are deleted
-- the deadline then moves to `archived`
+- then the deadline moves to archive
 
 ### Archived
 
 Archived deadlines:
 
-- are not shown in the active list
-- are shown in the archive view
-- are kept in JSON for history
-- may already have no channel messages left if cleanup already ran
+- no longer appear in the working list
+- appear in the archive screen
+- remain available for viewing card/details/history
+- usually already have zero channel messages left
+
+## Main UI Model
+
+### Main Reply Keyboard
+
+The main reply keyboard is intentionally minimal:
+
+- `Список дедлайнов`
+- `Архив`
+- `Обновить посты`
+
+All deadline-specific actions happen after opening a concrete deadline.
+
+### Paginated List Screens
+
+Both visible list and archive are paginated inline screens.
+
+Each list page:
+
+- shows a compact summary of several deadlines
+- provides one button per deadline
+- provides prev/next navigation when needed
+
+The visible list also exposes inline creation of a new deadline.
+
+### Deadline Card
+
+A deadline card is the action hub for one record.
+
+Depending on status it may allow:
+
+- edit
+- manual remind
+- cancel
+- delete into archive
+- open details/history
+
+### Deadline Details
+
+The details screen shows expanded metadata:
+
+- description
+- status
+- deadline time
+- creation time
+- creator
+- number of channel messages
+- number of history records
+- rendered event history
+
+The history is capped in length so the screen stays within Telegram message limits.
 
 ## Channel Message Tracking
 
-This project depends on storing every posted channel message.
+Every deadline-related channel post must be registered through `post_channel_template(...)`.
 
-That is not optional metadata. It is required because:
+That is a hard rule because the project depends on complete message tracking for:
 
-- cancellation cleanup must delete all related posts
-- manual delete must delete all related posts immediately
-- completion must edit the latest posted channel message
-- future message kinds may also need retroactive cleanup
+- reminder replacement
+- cancellation cleanup
+- completion edit-in-place
+- manual delete
+- bulk post refresh
 
-Because of that, any new channel post must be sent through `post_channel_template(...)` in `app.py`.
+If code sends directly via `context.bot.send_message(...)`, message cleanup and template refresh will become incomplete.
 
-If a new code path sends directly via `context.bot.send_message(...)`, cleanup will become incomplete.
-It will also break retroactive template refresh, because the bot will not have the structured data required to rebuild the post.
+## Refreshing Existing Posts
 
-## Formatting Rules
+When templates change in `bot_messages.py`, already published channel messages can be refreshed.
 
-The project uses Telegram HTML formatting in templates.
+`refresh_channel_posts(...)` walks through stored `channel_messages`, rebuilds each post from its `kind` and `template_data`, and edits Telegram messages in place where possible.
 
-Description formatting is preserved from user input by storing:
+This mechanism depends on structured `template_data` being stored with each channel message record.
 
-- `description` as plain text
-- `description_html` as Telegram-generated HTML from the incoming message entities
-
-This allows:
-
-- bold
-- italic
-- links
-- block quotes
-- custom emoji tags like `<tg-emoji ...>`
-
-The code should prefer `description_html` when rendering messages into the channel.
-
-## Date and Time Rules
+## Time Rules
 
 - input format is `DD.MM.YYYY` with optional `HH:MM`
 - all calculations use fixed timezone `UTC+5`
-- if time is omitted, logical time is `00:00`
-- if time is omitted, that `00:00` is not shown in rendered text
-- if the user explicitly sends `00:00`, it is shown
+- omitted time means logical `00:00`
+- implicit `00:00` is hidden in rendered text
+- explicit `00:00` is shown
 
-## Main User Flows
+## Background Jobs
 
-### Create
+The repeating job queue loop runs every minute and handles:
 
-1. User sends description.
-2. User sends full date or full date with time.
-3. If the deadline is more than 7 days away, the bot asks whether to publish immediately.
-4. Otherwise it publishes immediately.
-5. The deadline is tracked for reminders and later cleanup.
+- 7-day reminders
+- 24-hour reminders
+- transitions from active to completed
+- cleanup of cancelled/completed deadlines
+- transfer into archive after cleanup
 
-### Edit
-
-1. User chooses a deadline by id.
-2. User can replace or skip description.
-3. User can replace or skip date/time.
-4. If nothing really changed, the bot does nothing.
-5. If the deadline already had channel visibility, the bot posts a diff-style change message.
-
-### Cancel
-
-1. User chooses a deadline by id.
-2. Bot posts a cancellation message.
-3. Deadline leaves the active list.
-4. Cleanup is scheduled 3 days later.
-
-### Delete
-
-1. User chooses a deadline by id.
-2. Bot deletes all channel messages tied to the deadline immediately.
-3. Deadline is moved to archive.
-
-## Scheduling
-
-The bot uses `python-telegram-bot` job queue.
-
-The repeating job runs every minute and is responsible for:
-
-- sending 7-day reminders
-- sending 24-hour reminders
-- transitioning active deadlines into completed state
-- deleting all channel messages for cancelled/completed deadlines after the cleanup timestamp
+Because scheduling is derived from stored state, bot restarts do not lose reminder logic.
 
 ## Deployment Shape
 
-The repository includes a production deployment path for Ubuntu:
-
-- `.github/workflows/deploy.yml`
-- `deploy/install_service.sh`
-- `deploy/deploy.sh`
-- `deploy/deadline-bot.service`
-
-Production layout expects:
+Production deployment in this repo expects:
 
 - app code in `/opt/deadline-bot/app`
 - virtualenv in `/opt/deadline-bot/.venv`
 - env file in `/etc/deadline-bot/deadline-bot.env`
-- persistent data in `/var/lib/deadline-bot/deadlines.json`
+- persistent JSON in `/var/lib/deadline-bot/deadlines.json`
 
-## Constraints To Keep In Mind
+See [DEPLOYMENT.md](C:/Users/Roma/Desktop/projects/deadline%20bot/docs/DEPLOYMENT.md) for exact scripts and service setup.
 
-- JSON schema is treated as explicit and current, not backward-compatible forever
+## Constraints Worth Remembering
+
+- JSON schema should evolve through migrations, not endless compatibility branches
 - message wording and HTML live in `bot_messages.py`
-- channel posts must be tracked centrally
-- `tools.py` and `app.py` should not poll at the same time
-- changing deadline schema should be accompanied by a one-time JSON migration
+- deadline-related channel posts must always be tracked centrally
+- `tools.py` and `app.py` should not poll Telegram at the same time
+- visible list means “not archived”, not “only active”

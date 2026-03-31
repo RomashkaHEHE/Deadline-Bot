@@ -54,9 +54,12 @@ Example:
 ```env
 TOKEN=your_bot_token
 CHANNEL_ID=@your_channel_or_-1001234567890
+CHANNEL_THREAD_ID=
 WHITELIST_USER_IDS=123456789,987654321
 DEADLINES_STORAGE_PATH=/var/lib/deadline-bot/deadlines.json
 ```
+
+Leave `CHANNEL_THREAD_ID` empty if the bot should post into the main chat instead of a specific topic.
 
 ## 3. Configure SSH Deploy Access
 
