@@ -20,9 +20,11 @@ CHANNEL_ID=-100xxxxxxxxxx
 CHANNEL_THREAD_ID=
 WHITELIST_USER_IDS=123456789,987654321
 DEADLINES_STORAGE_PATH=/абсолютный/путь/к/deadlines.json
+INCLUDE_DEADLINE_HASHTAG=1
 ```
 
 `CHANNEL_THREAD_ID` можно оставить пустым. Тогда бот будет писать в общий чат супергруппы, а не в конкретный topic/thread.
+`INCLUDE_DEADLINE_HASHTAG=1` включает футер вида `🔜  #дедлайн` в каналных сообщениях. Если поставить `0`, `false`, `no` или `off`, этот футер исчезнет из шаблонов.
 
 3. Запустите бота:
 
@@ -152,6 +154,7 @@ py app.py
 - HTML-разметку
 - кастомные emoji
 - общий вид постов
+- включение или выключение футера `🔜  #дедлайн`
 
 ## Хранение данных и миграции
 

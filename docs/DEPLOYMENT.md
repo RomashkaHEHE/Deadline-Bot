@@ -57,9 +57,11 @@ CHANNEL_ID=@your_channel_or_-1001234567890
 CHANNEL_THREAD_ID=
 WHITELIST_USER_IDS=123456789,987654321
 DEADLINES_STORAGE_PATH=/var/lib/deadline-bot/deadlines.json
+INCLUDE_DEADLINE_HASHTAG=1
 ```
 
 Leave `CHANNEL_THREAD_ID` empty if the bot should post into the main chat instead of a specific topic.
+Set `INCLUDE_DEADLINE_HASHTAG=0` if channel posts should not include the `🔜  #дедлайн` footer.
 
 ## 3. Configure SSH Deploy Access
 

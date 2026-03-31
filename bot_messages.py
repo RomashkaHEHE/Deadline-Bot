@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 
 @dataclass(frozen=True)
@@ -21,6 +27,17 @@ EMOJIS = {
     # Central registry for reusable Telegram custom emoji snippets.
     "soon": '<tg-emoji emoji-id="5440621591387980068">🔜</tg-emoji>',
 }
+
+
+def env_flag(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+INCLUDE_DEADLINE_HASHTAG = env_flag("INCLUDE_DEADLINE_HASHTAG", True)
+DEADLINE_CHANNEL_FOOTER = f"{EMOJIS['soon']}  #дедлайн" if INCLUDE_DEADLINE_HASHTAG else ""
 
 
 def access_denied() -> MessageTemplate:
@@ -194,7 +211,8 @@ def deadline_changed_post(changes: list[dict], old_deadline: dict, new_deadline:
 
     if not lines:
         lines.append(f"{old_deadline['description_html']}\n{new_deadline['deadline_line_html']}")
-    return MessageTemplate("\n".join(lines) + f"\n\n{EMOJIS['soon']}  #дедлайн")
+    footer = f"\n\n{DEADLINE_CHANNEL_FOOTER}" if DEADLINE_CHANNEL_FOOTER else ""
+    return MessageTemplate("\n".join(lines) + footer)
 
 
 def deadline_changed_notice() -> MessageTemplate:
@@ -240,26 +258,29 @@ def cancelled() -> MessageTemplate:
 
 
 def active_deadline_post(deadline: dict) -> MessageTemplate:
+    footer = f"\n\n{DEADLINE_CHANNEL_FOOTER}" if DEADLINE_CHANNEL_FOOTER else ""
     return MessageTemplate(
         f"{deadline['description_html']}\n\n"
         f"{deadline['remaining_label_html']}: <b>{deadline['remaining_value']}</b>\n"
-        f"До: <b>{deadline['deadline_line_html']}</b>\n\n"
-        f"{EMOJIS['soon']}  #дедлайн"
+        f"До: <b>{deadline['deadline_line_html']}</b>"
+        f"{footer}"
     )
 
 
 def deadline_cancelled_post(deadline: dict) -> MessageTemplate:
+    footer = f"\n\n{DEADLINE_CHANNEL_FOOTER}" if DEADLINE_CHANNEL_FOOTER else ""
     return MessageTemplate(
         f"{deadline['description_html']}\n"
-        "отменён, отдыхаем\n\n"
-        f"{EMOJIS['soon']}  #дедлайн"
+        "отменён, отдыхаем"
+        f"{footer}"
     )
 
 
 def deadline_completed_post(deadline: dict) -> MessageTemplate:
+    footer = f"\n\n{DEADLINE_CHANNEL_FOOTER}" if DEADLINE_CHANNEL_FOOTER else ""
     return MessageTemplate(
         f"{deadline['description_html']}\n"
         f"{deadline['deadline_line_html']}\n"
-        "<b>дедлайн завершён</b>\n\n"
-        f"{EMOJIS['soon']}  #дедлайн"
+        "<b>дедлайн завершён</b>"
+        f"{footer}"
     )
