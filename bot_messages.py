@@ -157,7 +157,7 @@ def deadline_missing() -> MessageTemplate:
 
 
 def deadline_cancelled_private() -> MessageTemplate:
-    return MessageTemplate("Дедлайн отменен.")
+    return MessageTemplate("Дедлайн отменён. Старые сообщения удалены, новое сообщение отправлено в канал.")
 
 
 def deadline_deleted_private() -> MessageTemplate:
@@ -197,6 +197,14 @@ def edit_prompt_datetime(timezone_label: str) -> MessageTemplate:
     )
 
 
+def cancel_prompt_reason(deadline: dict) -> MessageTemplate:
+    return MessageTemplate(
+        "Отправьте причину отмены дедлайна.\n\n"
+        f"{deadline['description_html']}\n"
+        f"Срок: <b>{deadline['deadline_line_html']}</b>"
+    )
+
+
 def no_changes() -> MessageTemplate:
     return MessageTemplate("Изменений нет, дедлайн оставлен без изменений.")
 
@@ -216,7 +224,7 @@ def deadline_changed_post(changes: list[dict], old_deadline: dict, new_deadline:
 
 
 def deadline_changed_notice() -> MessageTemplate:
-    return MessageTemplate("Дедлайн изменен. Сообщение о переносе отправлено в канал.")
+    return MessageTemplate("Дедлайн изменен. Старые сообщения удалены, актуальное сообщение отправлено в канал.")
 
 
 def deadline_changed_actual_published() -> MessageTemplate:
@@ -268,10 +276,15 @@ def active_deadline_post(deadline: dict) -> MessageTemplate:
 
 
 def deadline_cancelled_post(deadline: dict) -> MessageTemplate:
+    return deadline_cancelled_post_with_reason(deadline, "не указана")
+
+
+def deadline_cancelled_post_with_reason(deadline: dict, reason_html: str) -> MessageTemplate:
     footer = f"\n\n{DEADLINE_CHANNEL_FOOTER}" if DEADLINE_CHANNEL_FOOTER else ""
     return MessageTemplate(
-        f"{deadline['description_html']}\n"
-        "отменён, отдыхаем"
+        f"<s>{deadline['description_html']}</s>\n"
+        f"<s>До: {deadline['deadline_line_html']}</s>\n\n"
+        f"Отменён по причине: {reason_html}"
         f"{footer}"
     )
 

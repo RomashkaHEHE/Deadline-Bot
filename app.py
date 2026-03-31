@@ -40,6 +40,7 @@ STORAGE_PATH = Path(os.getenv("DEADLINES_STORAGE_PATH", BASE_DIR / "deadlines.js
 
 CREATE_DESCRIPTION, CREATE_DATETIME, CREATE_CONFIRM = range(3)
 EDIT_DESCRIPTION, EDIT_DATETIME, EDIT_CONFIRM = range(10, 13)
+CANCEL_REASON = 20
 
 IMMEDIATE_CALLBACK = "immediate_publish"
 EDIT_IMMEDIATE_CALLBACK = "edit_immediate_publish"
@@ -300,6 +301,14 @@ def live_deadline_template_data(deadline: Deadline) -> dict:
     return {"deadline": live_deadline_context(deadline)}
 
 
+def cancelled_template_data(deadline: dict, reason: str, reason_html: str) -> dict:
+    return {
+        "deadline": deadline,
+        "reason": reason,
+        "reason_html": reason_html,
+    }
+
+
 def changed_template_data(changes: list[dict], old_deadline: dict, new_deadline: dict) -> dict:
     return {
         "changes": changes,
@@ -387,6 +396,12 @@ def legacy_template_data_for_kind(item: dict, kind: str) -> dict:
     if kind in {"initial", "reminder_7d", "reminder_24h", "reminder_manual"}:
         return {"deadline": legacy_live_context_from_item(item)}
     if kind in {"cancelled", "completed"}:
+        if kind == "cancelled":
+            return {
+                "deadline": legacy_context_from_item(item),
+                "reason": "не указана",
+                "reason_html": "не указана",
+            }
         return {"deadline": legacy_context_from_item(item)}
     return {}
 
@@ -914,6 +929,9 @@ def render_history_entry(event: DeadlineEvent) -> str:
             lines.append(f"  {line}")
         return "\n".join(lines)
     if event.kind == "cancelled":
+        reason = event.details.get("reason")
+        if reason:
+            return f"• <b>{timestamp}</b> — {actor} отменил дедлайн. Причина: <code>{escape(reason)}</code>"
         return f"• <b>{timestamp}</b> — {actor} отменил дедлайн"
     if event.kind == "completed":
         return f"• <b>{timestamp}</b> — дедлайн завершён"
@@ -1058,6 +1076,17 @@ async def sync_edit_origin(context: ContextTypes.DEFAULT_TYPE, deadline: Deadlin
     template, keyboard = build_deadline_card_screen(deadline, source, page)
     await update_message_screen(context, origin["chat_id"], origin["message_id"], template, keyboard)
 
+
+async def sync_cancel_origin(context: ContextTypes.DEFAULT_TYPE, deadline: Deadline) -> None:
+    origin = context.user_data.get("cancel_origin")
+    if not origin:
+        return
+
+    source = source_for_deadline(deadline)
+    page = origin["page"] if source == origin["source"] else 0
+    template, keyboard = build_deadline_card_screen(deadline, source, page)
+    await update_message_screen(context, origin["chat_id"], origin["message_id"], template, keyboard)
+
 def render_channel_template(record: ChannelMessageRecord) -> msg.MessageTemplate:
     data = record.template_data
     if not data:
@@ -1068,7 +1097,10 @@ def render_channel_template(record: ChannelMessageRecord) -> msg.MessageTemplate
     if record.kind in {"initial", "reminder_7d", "reminder_24h", "reminder_manual"}:
         return msg.active_deadline_post(live_deadline_context_from_payload(data["deadline"]))
     if record.kind == "cancelled":
-        return msg.deadline_cancelled_post(data["deadline"])
+        return msg.deadline_cancelled_post_with_reason(
+            data["deadline"],
+            data.get("reason_html", escape(data.get("reason", "не указана"))),
+        )
     if record.kind == "completed":
         return msg.deadline_completed_post(data["deadline"])
     if record.kind == "changed":
@@ -1114,6 +1146,47 @@ async def delete_all_deadline_messages(context: ContextTypes.DEFAULT_TYPE, deadl
     await STORE.update(deadline)
 
 
+async def delete_deadline_records(
+    context: ContextTypes.DEFAULT_TYPE,
+    deadline: Deadline,
+    records: list[ChannelMessageRecord],
+) -> list[ChannelMessageRecord]:
+    failed: list[ChannelMessageRecord] = []
+    for record in records:
+        try:
+            await context.bot.delete_message(chat_id=CHANNEL_ID, message_id=record.message_id)
+        except Exception as exc:
+            LOGGER.warning("Failed to delete message %s for deadline %s: %s", record.message_id, deadline.id, exc)
+            failed.append(record)
+    return failed
+
+
+async def replace_deadline_messages_with_template(
+    context: ContextTypes.DEFAULT_TYPE,
+    deadline: Deadline,
+    template: msg.MessageTemplate,
+    *,
+    kind: str,
+    template_data: dict,
+) -> Message:
+    old_records = list(deadline.channel_messages)
+    sent = await post_channel_template(
+        context,
+        deadline,
+        template,
+        kind=kind,
+        template_data=template_data,
+    )
+    if not old_records:
+        return sent
+
+    new_record = deadline.channel_messages[-1]
+    failed_old_records = await delete_deadline_records(context, deadline, old_records)
+    deadline.channel_messages = failed_old_records + [new_record]
+    await STORE.update(deadline)
+    return sent
+
+
 async def publish_live_deadline_post(
     context: ContextTypes.DEFAULT_TYPE,
     deadline: Deadline,
@@ -1123,17 +1196,23 @@ async def publish_live_deadline_post(
     actor_id: int | None = None,
     actor_name: str | None = None,
 ) -> None:
-    if replace_existing:
-        await delete_all_deadline_messages(context, deadline)
-
     template_data = live_deadline_template_data(deadline)
-    await post_channel_template(
-        context,
-        deadline,
-        msg.active_deadline_post(template_data["deadline"]),
-        kind=kind,
-        template_data=template_data,
-    )
+    if replace_existing:
+        await replace_deadline_messages_with_template(
+            context,
+            deadline,
+            msg.active_deadline_post(template_data["deadline"]),
+            kind=kind,
+            template_data=template_data,
+        )
+    else:
+        await post_channel_template(
+            context,
+            deadline,
+            msg.active_deadline_post(template_data["deadline"]),
+            kind=kind,
+            template_data=template_data,
+        )
     deadline.initial_published = True
     if kind == "initial":
         add_history_event(
@@ -1167,7 +1246,7 @@ async def maybe_send_initial_publication(
             context,
             deadline,
             kind="initial",
-            replace_existing=False,
+            replace_existing=True,
             actor_id=actor_id,
             actor_name=actor_name,
         )
@@ -1186,19 +1265,28 @@ async def cancel_deadline(
     context: ContextTypes.DEFAULT_TYPE,
     deadline: Deadline,
     *,
+    reason: str,
+    reason_html: str,
     actor_id: int | None = None,
     actor_name: str | None = None,
 ) -> None:
+    original_context = deadline_context(deadline)
     deadline.status = STATUS_CANCELLED
     deadline.cleanup_after = (bot_now() + timedelta(days=3)).isoformat()
-    add_history_event(deadline, "cancelled", actor_id=actor_id, actor_name=actor_name)
+    add_history_event(
+        deadline,
+        "cancelled",
+        actor_id=actor_id,
+        actor_name=actor_name,
+        details={"reason": reason},
+    )
     await STORE.update(deadline)
 
-    template_data = deadline_template_data(deadline)
-    await post_channel_template(
+    template_data = cancelled_template_data(original_context, reason, reason_html)
+    await replace_deadline_messages_with_template(
         context,
         deadline,
-        msg.deadline_cancelled_post(template_data["deadline"]),
+        msg.deadline_cancelled_post_with_reason(template_data["deadline"], template_data["reason_html"]),
         kind="cancelled",
         template_data=template_data,
     )
@@ -1247,6 +1335,11 @@ async def mark_deadline_completed(context: ContextTypes.DEFAULT_TYPE, deadline: 
     add_history_event(deadline, "completed", actor_name="бот")
 
     if deadline.channel_messages:
+        if len(deadline.channel_messages) > 1:
+            last_record = deadline.channel_messages[-1]
+            failed_old_records = await delete_deadline_records(context, deadline, deadline.channel_messages[:-1])
+            deadline.channel_messages = failed_old_records + [last_record]
+
         last_record = deadline.channel_messages[-1]
         template_data = deadline_template_data(deadline)
         template = msg.deadline_completed_post(template_data["deadline"])
@@ -1263,6 +1356,13 @@ async def mark_deadline_completed(context: ContextTypes.DEFAULT_TYPE, deadline: 
             last_record.template_data = template_data
         except Exception as exc:
             LOGGER.warning("Failed to edit completion message for deadline %s: %s", deadline.id, exc)
+            await replace_deadline_messages_with_template(
+                context,
+                deadline,
+                template,
+                kind="completed",
+                template_data=template_data,
+            )
 
     await STORE.update(deadline)
 
@@ -1646,29 +1746,34 @@ async def edit_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data["edit_old_context"] = deadline_context(old_deadline)
     context.user_data["edit_new_context"] = deadline_context(deadline)
 
+    if had_any_publication:
+        deadline.immediate_publish_skipped = False
+        await STORE.update(deadline)
+        template_data = changed_template_data(changes, deadline_context(old_deadline), deadline_context(deadline))
+        await replace_deadline_messages_with_template(
+            context,
+            deadline,
+            msg.deadline_changed_post(changes, template_data["old_deadline"], template_data["new_deadline"]),
+            kind="changed",
+            template_data=template_data,
+        )
+        await align_reminder_flags(deadline)
+        await reply(update.message, msg.deadline_changed_notice(), reply_markup=main_keyboard())
+        await sync_edit_origin(context, deadline)
+        return ConversationHandler.END
+
     if now_until(deadline_at) <= timedelta(days=7):
         deadline.immediate_publish_skipped = False
         await STORE.update(deadline)
         await align_reminder_flags(deadline)
-        if had_any_publication:
-            template_data = changed_template_data(changes, deadline_context(old_deadline), deadline_context(deadline))
-            await post_channel_template(
-                context,
-                deadline,
-                msg.deadline_changed_post(changes, template_data["old_deadline"], template_data["new_deadline"]),
-                kind="changed",
-                template_data=template_data,
-            )
-            await reply(update.message, msg.deadline_changed_notice(), reply_markup=main_keyboard())
-        else:
-            await maybe_send_initial_publication(
-                context,
-                deadline,
-                force=False,
-                actor_id=actor_id,
-                actor_name=actor_name,
-            )
-            await reply(update.message, msg.deadline_changed_actual_published(), reply_markup=main_keyboard())
+        await maybe_send_initial_publication(
+            context,
+            deadline,
+            force=False,
+            actor_id=actor_id,
+            actor_name=actor_name,
+        )
+        await reply(update.message, msg.deadline_changed_actual_published(), reply_markup=main_keyboard())
         await sync_edit_origin(context, deadline)
         return ConversationHandler.END
 
@@ -1706,6 +1811,23 @@ async def edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     new_context = deadline_context(deadline)
     actor_id, actor_name = actor_from_update(update)
 
+    if had_any_publication:
+        template_data = changed_template_data(changes, old_context, new_context)
+        await replace_deadline_messages_with_template(
+            context,
+            deadline,
+            msg.deadline_changed_post(changes, template_data["old_deadline"], template_data["new_deadline"]),
+            kind="changed",
+            template_data=template_data,
+        )
+        await align_reminder_flags(deadline)
+        template = msg.deadline_changed_notice()
+        await query.edit_message_text(template.text, parse_mode=template.parse_mode)
+        if query.message:
+            await reply(query.message, msg.start_message(), reply_markup=main_keyboard())
+        await sync_edit_origin(context, deadline)
+        return ConversationHandler.END
+
     if answer == "yes":
         deadline.initial_published = False
         deadline.immediate_publish_skipped = False
@@ -1722,21 +1844,67 @@ async def edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         deadline.immediate_publish_skipped = True
         await STORE.update(deadline)
         template = msg.edit_saved_with_change_no_publish() if had_any_publication else msg.edit_saved_no_publish()
-
-    if had_any_publication:
-        template_data = changed_template_data(changes, old_context, new_context)
-        await post_channel_template(
-            context,
-            deadline,
-            msg.deadline_changed_post(changes, template_data["old_deadline"], template_data["new_deadline"]),
-            kind="changed",
-            template_data=template_data,
-        )
     await align_reminder_flags(deadline)
     await query.edit_message_text(template.text, parse_mode=template.parse_mode)
     if query.message:
         await reply(query.message, msg.start_message(), reply_markup=main_keyboard())
     await sync_edit_origin(context, deadline)
+    return ConversationHandler.END
+
+
+async def cancel_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await require_whitelist(update):
+        return ConversationHandler.END
+
+    query = update.callback_query
+    await query.answer()
+    _, _, source, raw_page, raw_id = query.data.split(":")
+    deadline = STORE.get(int(raw_id))
+    if deadline is None or deadline.status != STATUS_ACTIVE:
+        template = msg.deadline_missing()
+        await query.edit_message_text(template.text, parse_mode=template.parse_mode)
+        return ConversationHandler.END
+
+    context.user_data["cancel_deadline_id"] = deadline.id
+    context.user_data["cancel_origin"] = remember_screen_origin(query, source, int(raw_page))
+    await reply(
+        query.message,
+        msg.cancel_prompt_reason(deadline_context(deadline)),
+        reply_markup=input_keyboard(),
+    )
+    return CANCEL_REASON
+
+
+async def cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    handled, next_state = await maybe_handle_menu_navigation(update, context)
+    if handled:
+        return next_state if next_state is not None else ConversationHandler.END
+
+    deadline = STORE.get(context.user_data["cancel_deadline_id"])
+    if deadline is None or deadline.status != STATUS_ACTIVE:
+        await reply(update.message, msg.deadline_missing(), reply_markup=main_keyboard())
+        return ConversationHandler.END
+
+    reason = update.message.text.strip()
+    if not reason:
+        await reply(
+            update.message,
+            msg.MessageTemplate("Причина отмены не должна быть пустой."),
+            reply_markup=input_keyboard(),
+        )
+        return CANCEL_REASON
+    reason_html = update.message.text_html or escape(reason)
+    actor_id, actor_name = actor_from_update(update)
+    await cancel_deadline(
+        context,
+        deadline,
+        reason=reason,
+        reason_html=reason_html,
+        actor_id=actor_id,
+        actor_name=actor_name,
+    )
+    await reply(update.message, msg.deadline_cancelled_private(), reply_markup=main_keyboard())
+    await sync_cancel_origin(context, deadline)
     return ConversationHandler.END
 
 
@@ -1810,15 +1978,6 @@ async def deadline_action_callback(update: Update, context: ContextTypes.DEFAULT
             await query.answer("Напоминание доступно только для активного дедлайна.", show_alert=True)
             return
         await remind_deadline(context, deadline, actor_id=actor_id, actor_name=actor_name)
-        template, keyboard = build_deadline_card_screen(deadline, SOURCE_VISIBLE, page)
-        await edit_query_screen(query, template, keyboard)
-        return
-
-    if action == ACTION_CANCEL:
-        if deadline.status != STATUS_ACTIVE:
-            await query.answer("Отмена доступна только для активного дедлайна.", show_alert=True)
-            return
-        await cancel_deadline(context, deadline, actor_id=actor_id, actor_name=actor_name)
         template, keyboard = build_deadline_card_screen(deadline, SOURCE_VISIBLE, page)
         await edit_query_screen(query, template, keyboard)
         return
@@ -1912,6 +2071,20 @@ def build_application() -> Application:
         ],
     )
 
+    cancel_conversation = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(cancel_start, pattern=f"^{ACTION_CALLBACK}:{ACTION_CANCEL}:"),
+        ],
+        states={
+            CANCEL_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, cancel_reason)],
+        },
+        fallbacks=[
+            CommandHandler("start", start),
+            CommandHandler("cancel", abort_conversation),
+            MessageHandler(filters.Regex(f"^{BUTTON_ABORT}$"), abort_conversation),
+        ],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("now", show_current_time))
     application.add_handler(CommandHandler("list", show_visible_list))
@@ -1920,13 +2093,14 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("cancel", abort_conversation))
     application.add_handler(create_conversation)
     application.add_handler(edit_conversation)
+    application.add_handler(cancel_conversation)
     application.add_handler(CallbackQueryHandler(list_page_callback, pattern=f"^{LIST_CALLBACK}:"))
     application.add_handler(CallbackQueryHandler(open_deadline_callback, pattern=f"^{OPEN_CALLBACK}:"))
     application.add_handler(CallbackQueryHandler(details_callback, pattern=f"^{DETAILS_CALLBACK}:"))
     application.add_handler(
         CallbackQueryHandler(
             deadline_action_callback,
-            pattern=f"^{ACTION_CALLBACK}:({ACTION_CANCEL}|{ACTION_DELETE}|{ACTION_REMIND}):",
+            pattern=f"^{ACTION_CALLBACK}:({ACTION_DELETE}|{ACTION_REMIND}):",
         )
     )
     application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_LIST}$"), show_visible_list))
