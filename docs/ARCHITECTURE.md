@@ -106,6 +106,8 @@ Instead:
 
 That approach keeps runtime code clean while still allowing server data to evolve in place.
 
+If the storage file is malformed or has an unusable structure, the bot preserves the original bytes as `unformatted-<name>.json` in the same directory, using numbered suffixes when needed, and then recreates a fresh empty storage file at the original path.
+
 If the schema changes again, add a new migration step in `migrate_storage(...)` and bump `CURRENT_SCHEMA_VERSION`.
 
 ## Deadline Lifecycle

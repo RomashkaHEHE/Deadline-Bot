@@ -485,31 +485,69 @@ class DeadlineStore:
             encoding="utf-8",
         )
 
+    def _next_unformatted_backup_path(self) -> Path:
+        # Keep malformed storage files next to the live JSON and use
+        # Windows-like suffixes so repeated recoveries never overwrite older
+        # evidence.
+        base_name = f"unformatted-{self.path.stem}"
+        suffix = self.path.suffix
+        candidate = self.path.with_name(f"{base_name}{suffix}")
+        counter = 1
+        while candidate.exists():
+            candidate = self.path.with_name(f"{base_name} ({counter}){suffix}")
+            counter += 1
+        return candidate
+
+    def _recover_invalid_storage(self, raw_bytes: bytes, exc: Exception) -> None:
+        backup_path = self._next_unformatted_backup_path()
+        backup_path.write_bytes(raw_bytes)
+        self._deadlines = []
+        self._next_id = 1
+        self._write_sync()
+        LOGGER.warning(
+            "Storage file %s had an invalid format. Original content was saved to %s and a new empty storage was created. Reason: %s",
+            self.path,
+            backup_path,
+            exc,
+        )
+
     def _load(self) -> None:
         if not self.path.exists():
             return
 
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
-        version = int(raw.get("schema_version", 1))
-        migrated = False
-        while version < CURRENT_SCHEMA_VERSION:
-            raw = migrate_storage(raw, version)
-            version = raw["schema_version"]
-            migrated = True
+        raw_bytes = self.path.read_bytes()
+        try:
+            raw = json.loads(raw_bytes.decode("utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("storage root must be a JSON object")
+            if "deadlines" in raw and not isinstance(raw["deadlines"], list):
+                raise ValueError("'deadlines' must be a JSON array")
 
-        self._next_id = raw.get("next_id", 1)
-        deadlines: list[Deadline] = []
-        for item in raw.get("deadlines", []):
-            messages = [ChannelMessageRecord(**record) for record in item.get("channel_messages", [])]
-            history = [DeadlineEvent(**event) for event in item.get("history", [])]
-            payload = dict(item)
-            payload["channel_messages"] = messages
-            payload["history"] = history
-            deadlines.append(Deadline(**payload))
-        self._deadlines = deadlines
+            version = int(raw.get("schema_version", 1))
+            if version > CURRENT_SCHEMA_VERSION:
+                raise RuntimeError(f"Unsupported storage schema version: {version}")
 
-        if migrated:
-            self._write_sync()
+            migrated = False
+            while version < CURRENT_SCHEMA_VERSION:
+                raw = migrate_storage(raw, version)
+                version = raw["schema_version"]
+                migrated = True
+
+            self._next_id = int(raw.get("next_id", 1))
+            deadlines: list[Deadline] = []
+            for item in raw.get("deadlines", []):
+                messages = [ChannelMessageRecord(**record) for record in item.get("channel_messages", [])]
+                history = [DeadlineEvent(**event) for event in item.get("history", [])]
+                payload = dict(item)
+                payload["channel_messages"] = messages
+                payload["history"] = history
+                deadlines.append(Deadline(**payload))
+            self._deadlines = deadlines
+
+            if migrated:
+                self._write_sync()
+        except Exception as exc:
+            self._recover_invalid_storage(raw_bytes, exc)
 
     async def _save(self) -> None:
         self._write_sync()
