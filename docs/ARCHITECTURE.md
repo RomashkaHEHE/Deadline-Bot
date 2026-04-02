@@ -256,6 +256,7 @@ This mechanism depends on structured `template_data` being stored with each chan
 
 The repeating job queue loop runs every minute and handles:
 
+- background refresh of active live posts so remaining time stays current
 - 7-day reminders
 - 24-hour reminders
 - transitions from active to completed

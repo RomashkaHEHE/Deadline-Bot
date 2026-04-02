@@ -59,6 +59,8 @@ ACTION_REMIND = "rm"
 SOURCE_VISIBLE = "visible"
 SOURCE_ARCHIVE = "archive"
 
+LIVE_POST_KINDS = {"initial", "reminder_7d", "reminder_24h", "reminder_manual"}
+
 PAGE_SIZE = 6
 CURRENT_SCHEMA_VERSION = 2
 
@@ -1102,7 +1104,7 @@ def render_channel_template(record: ChannelMessageRecord) -> msg.MessageTemplate
 
     # Channel posts are rebuilt from structured template_data rather than from
     # their stored text so message templates can evolve later via refresh.
-    if record.kind in {"initial", "reminder_7d", "reminder_24h", "reminder_manual"}:
+    if record.kind in LIVE_POST_KINDS:
         return msg.active_deadline_post(live_deadline_context_from_payload(data["deadline"]))
     if record.kind == "cancelled":
         return msg.deadline_cancelled_post_with_reason(
@@ -1193,6 +1195,82 @@ async def replace_deadline_messages_with_template(
     deadline.channel_messages = failed_old_records + [new_record]
     await STORE.update(deadline)
     return sent
+
+
+async def refresh_channel_record(
+    context: ContextTypes.DEFAULT_TYPE,
+    deadline: Deadline,
+    record: ChannelMessageRecord,
+    template: msg.MessageTemplate,
+    *,
+    template_data: dict | None = None,
+) -> str:
+    if template.text == record.text and template.parse_mode == record.parse_mode:
+        if template_data is not None and template_data != record.template_data:
+            record.template_data = template_data
+            await STORE.update(deadline)
+        return "unchanged"
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=CHANNEL_ID,
+            message_id=record.message_id,
+            text=template.text,
+            parse_mode=template.parse_mode,
+        )
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            record.text = template.text
+            record.parse_mode = template.parse_mode
+            if template_data is not None:
+                record.template_data = template_data
+            await STORE.update(deadline)
+            return "unchanged"
+        LOGGER.warning(
+            "Failed to refresh deadline %s message %s: %s",
+            deadline.id,
+            record.message_id,
+            exc,
+        )
+        return "failed"
+    except Exception as exc:
+        LOGGER.warning(
+            "Failed to refresh deadline %s message %s: %s",
+            deadline.id,
+            record.message_id,
+            exc,
+        )
+        return "failed"
+
+    record.text = template.text
+    record.parse_mode = template.parse_mode
+    if template_data is not None:
+        record.template_data = template_data
+    await STORE.update(deadline)
+    return "updated"
+
+
+async def refresh_active_deadline_post_if_needed(
+    context: ContextTypes.DEFAULT_TYPE,
+    deadline: Deadline,
+) -> bool:
+    if deadline.status != STATUS_ACTIVE or not deadline.channel_messages:
+        return False
+
+    current_record = deadline.channel_messages[-1]
+    if current_record.kind not in LIVE_POST_KINDS:
+        return False
+
+    template_data = live_deadline_template_data(deadline)
+    template = msg.active_deadline_post(template_data["deadline"])
+    result = await refresh_channel_record(
+        context,
+        deadline,
+        current_record,
+        template,
+        template_data=template_data,
+    )
+    return result == "updated"
 
 
 async def publish_live_deadline_post(
@@ -1431,7 +1509,6 @@ async def refresh_channel_posts(update: Update, context: ContextTypes.DEFAULT_TY
     failed = 0
 
     for deadline in all_deadlines:
-        dirty = False
         for record in deadline.channel_messages:
             try:
                 template = render_channel_template(record)
@@ -1445,50 +1522,13 @@ async def refresh_channel_posts(update: Update, context: ContextTypes.DEFAULT_TY
                 )
                 continue
 
-            if template.text == record.text and template.parse_mode == record.parse_mode:
+            result = await refresh_channel_record(context, deadline, record, template)
+            if result == "updated":
+                updated += 1
+            elif result == "unchanged":
                 unchanged += 1
-                continue
-
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=CHANNEL_ID,
-                    message_id=record.message_id,
-                    text=template.text,
-                    parse_mode=template.parse_mode,
-                )
-            except BadRequest as exc:
-                if "message is not modified" in str(exc).lower():
-                    unchanged += 1
-                    record.text = template.text
-                    record.parse_mode = template.parse_mode
-                    dirty = True
-                    continue
-
+            else:
                 failed += 1
-                LOGGER.warning(
-                    "Failed to refresh deadline %s message %s: %s",
-                    deadline.id,
-                    record.message_id,
-                    exc,
-                )
-                continue
-            except Exception as exc:
-                failed += 1
-                LOGGER.warning(
-                    "Failed to refresh deadline %s message %s: %s",
-                    deadline.id,
-                    record.message_id,
-                    exc,
-                )
-                continue
-
-            record.text = template.text
-            record.parse_mode = template.parse_mode
-            updated += 1
-            dirty = True
-
-        if dirty:
-            await STORE.update(deadline)
 
     await reply(
         update.effective_message,
@@ -2011,6 +2051,7 @@ async def reminder_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await mark_deadline_completed(context, deadline)
                 continue
 
+            published_new_live_post = False
             if not deadline.reminded_7d and remaining <= timedelta(days=7):
                 await publish_live_deadline_post(
                     context,
@@ -2021,6 +2062,7 @@ async def reminder_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 deadline.reminded_7d = True
                 await STORE.update(deadline)
+                published_new_live_post = True
 
             if not deadline.reminded_24h and remaining <= timedelta(hours=24):
                 await publish_live_deadline_post(
@@ -2032,6 +2074,10 @@ async def reminder_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 deadline.reminded_24h = True
                 await STORE.update(deadline)
+                published_new_live_post = True
+
+            if not published_new_live_post:
+                await refresh_active_deadline_post_if_needed(context, deadline)
             continue
 
         if deadline.status in {STATUS_CANCELLED, STATUS_COMPLETED}:
